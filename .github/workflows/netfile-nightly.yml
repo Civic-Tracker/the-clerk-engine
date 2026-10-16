@@ -1,9 +1,10 @@
 name: clerk-netfile-nightly
 # Step 1 of The Clerk Engine: NetFile adapter, STAGING ONLY (staging R2 + staging D1, hidden rows).
-# Nightly 2:30 AM Pacific-ish (09:30 UTC). Manual run: Actions tab > Run workflow.
+# Nightly at 09:17 UTC (~2:17 AM PDT / 1:17 AM PST). Off the :00/:30 marks, where GitHub's scheduler
+# is busiest and runs start hours late. Manual run: Actions tab > Run workflow.
 on:
   schedule:
-    - cron: "30 9 * * *"
+    - cron: "17 9 * * *"
   workflow_dispatch:
     inputs:
       only:
@@ -28,13 +29,20 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
-          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then echo "::error::Repo secret CLOUDFLARE_API_TOKEN not set (see README: TODO for Bryan)"; exit 1; fi
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            msg="Repo secret CLOUDFLARE_API_TOKEN is not set for this repo (Settings > Secrets and variables > Actions > Repository secrets). Nothing was fetched or written."
+            echo "::error::$msg"
+            printf '## Clerk Engine - NetFile -> staging\n\n**FAILED - config: %s**\n' "$msg" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
       - name: NetFile -> staging (fetch, sha256, diff vs staging D1, store new to R2, register hidden)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ONLY: ${{ github.event.inputs.only }}
         run: |
+          mkdir -p reports
           python3 adapters/netfile.py --pack packs/la-county-netfile.json \
-            --only "${{ github.event.inputs.only }}" --max-seconds 3000 \
+            --only "$ONLY" --max-seconds 3000 \
             --report "reports/run-$(date -u +%Y%m%dT%H%M).json"
       - name: Daily Clerk report (artifact for Hark to read)
         if: always()
@@ -42,4 +50,5 @@ jobs:
         with:
           name: clerk-netfile-report
           path: reports/run-*.json
+          if-no-files-found: ignore
           retention-days: 30
