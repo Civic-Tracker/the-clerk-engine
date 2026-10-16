@@ -17,7 +17,7 @@ Free-tier scripts that do Civic Tracker's repeat grind (fetch, fingerprint, diff
 | `lib/net.py` | Shared retry: exponential backoff + jitter on 429/5xx/timeouts (NetFile, D1, R2, Cloudflare API). |
 | `tests/` | `python3 -m unittest discover -s tests` (stdlib, no network). |
 | `packs/la-county-netfile.json` | Jurisdiction pack. **New city = one config row** (`slug`, `agency` code, `jurisdiction_id`). |
-| `.github/workflows/netfile-nightly.yml` | Nightly 09:17 UTC + manual dispatch; per-city table on the run page (job summary); uploads the JSON report as an artifact. |
+| `.github/workflows/netfile-nightly.yml` | Nightly 04:47 UTC (before clerk-review at 06:23 UTC) + manual dispatch; per-city table on the run page (job summary); uploads the JSON report as an artifact. |
 | `reports/` | Dry-run summary. Nightly JSON reports go to Actions artifacts (gitignored). |
 | `docs/STEP2-mail-intake.md` | What Step 2 (Apps Script mail intake) needs. |
 | `review/clerk_review.py` | Clerk review of OCR'd money (see below). Stdlib Python + tesseract/poppler. |
