@@ -1,10 +1,10 @@
 name: clerk-netfile-nightly
 # Step 1 of The Clerk Engine: NetFile adapter, STAGING ONLY (staging R2 + staging D1, hidden rows).
-# Nightly at 09:17 UTC (~2:17 AM PDT / 1:17 AM PST). Off the :00/:30 marks, where GitHub's scheduler
+# Nightly at 04:47 UTC (~9:47 PM PDT / 8:47 PM PST), before clerk-review (06:23 UTC) so new filings are reviewed the same night. Off the :00/:30 marks, where GitHub's scheduler
 # is busiest and runs start hours late. Manual run: Actions tab > Run workflow.
 on:
   schedule:
-    - cron: "17 9 * * *"
+    - cron: "47 4 * * *"
   workflow_dispatch:
     inputs:
       only:
