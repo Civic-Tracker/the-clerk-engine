@@ -30,10 +30,22 @@ BOX_E_DROPPED = BOX_E.replace("$ 881.23", "")          # OCR lost line 2's amoun
 
 
 class FakePages:
-    """Pages stand-in: read A / B / C texts per page."""
-    def __init__(self, a, b=None, c=None):
-        self.t = {"A": a, "B": b or a, "C": c or a}
+    """Pages stand-in: read A / B / C / D texts per page, word boxes (read T) and cell re-reads."""
+    def __init__(self, a, b=None, c=None, d=None, words=None, cells=None):
+        self.t = {"A": a, "B": b or a, "C": c or a, "D": d or {}}
+        self.w = words or {}
+        self.cell_text = cells or {}
         self.calls = defaultdict(int)
+
+    def words(self, slug, sha, key, p):
+        return self.w.get(p, [])
+
+    def cached_words(self, sha, p):
+        return True
+
+    def cells(self, slug, sha, key, p, boxes):
+        self.calls["cells"] += len(boxes)
+        return [self.cell_text.get((p, int(b[1]) // 100), "") for b in boxes]
 
     def read_a(self, slug, sha, key, p):
         return self.t["A"].get(p, "")
@@ -121,9 +133,26 @@ class TestReview(unittest.TestCase):
         c = BOX_A.replace("16,930.00", "16,980.00")
         p = self.pages(BOX_A, b=b)
         p.t["C"] = dict(p.t["A"]); p.t["C"][2] = c
+        p.t["D"] = {2: BOX_A.replace("16,930.00", "16,830.00")}
         rows = [row(1, "460A", 1693000)]
         r = R.review_filing(filing(), rows, p, deadline=9e18)
         self.assertIn("A:summary_reads_disagree", r["fail"])
+
+    def test_read_d_settles_three_way_disagreement(self):
+        b = BOX_A.replace("16,930.00", "18,930.00").replace("17,035.00", "19,035.00")
+        c = BOX_A.replace("16,930.00", "16,980.00")
+        p = self.pages(BOX_A, b=b)
+        p.t["C"] = dict(p.t["A"]); p.t["C"][2] = c
+        p.t["D"] = {2: BOX_A}                              # D agrees with A exactly: 2 reads, no rival pair
+        r = R.review_filing(filing(), [row(1, "460A", 1693000)], p, deadline=9e18)
+        self.assertEqual(r["fail"], [])
+        self.assertEqual(r["checks"]["A"]["reads"][0]["settled_by"], "read_D")
+
+    def test_vote(self):
+        self.assertEqual(R.vote([1, 1, 2]), 1)
+        self.assertIsNone(R.vote([1, 2, 3]))
+        self.assertIsNone(R.vote([1, 1, 2, 2]))           # two pairs disagree: nothing is accepted
+        self.assertIsNone(R.vote([None, None, 5]))
 
     def test_tiebreak_read_c(self):
         b = BOX_A.replace("16,930.00", "18,930.00")
@@ -189,11 +218,27 @@ class TestNames(unittest.TestCase):
         for n in ["", None, "Michael Abrams", "SUTTON LAW FIRM", "Ng, Al"]:
             self.assertFalse(R.form_text_name(n), n)
 
-    def test_form_text_row_flags(self):
+    def test_form_text_name_cleared_when_rows_reconcile(self):
         rows = [row(1, "460A", 1693000, name="OF BUSINESS)")]
         a = {1: "Summary Page", 2: BOX_A, 3: ""}
         r = R.review_filing(filing(), rows, FakePages(a), deadline=9e18)
+        self.assertEqual(r["fail"], [])
+        self.assertEqual([(c["rule"], c["after"]) for c in r["corrections"]], [("clear_form_text_name", "")])
+
+    def test_form_text_row_dropped_only_if_then_reconciles(self):
+        rows = [row(1, "460A", 1693000), row(2, "460A", 50000, name="AMOUNT RECEIVED THIS PERIOD")]
+        a = {1: "Summary Page", 2: BOX_A, 3: ""}
+        r = R.review_filing(filing(), rows, FakePages(a), deadline=9e18)
+        self.assertEqual(r["fail"], [])
+        self.assertEqual([(c["rule"], c["transaction_id"], c["after"]) for c in r["corrections"]],
+                         [("drop_form_text_row", "ct_2", "OCR_REJECTED")])
+
+    def test_form_text_row_kept_flagged_when_no_reconcile(self):
+        rows = [row(1, "460A", 1000000), row(2, "460A", 50000, name="OF BUSINESS)")]
+        a = {1: "Summary Page", 2: BOX_A, 3: ""}
+        r = R.review_filing(filing(), rows, FakePages(a), deadline=9e18)
         self.assertIn("A:row_name_is_form_text", r["fail"])
+        self.assertIn("A:rows_do_not_reconcile", r["fail"])
 
 
 class TestDuplicates(unittest.TestCase):
@@ -227,7 +272,7 @@ class TestDuplicates(unittest.TestCase):
         self.assertEqual({k: v[0] for k, v in d.items()}, {"cf_1": "overlapping_periods", "cf_2": "overlapping_periods"})
 
     def test_different_committees_differnt_rows_ok(self):
-        fs = {"cf_1": filing("cf_1"), "cf_2": filing("cf_2", filer_identity_id="csi_b", filer_name_raw="Committee B")}
+        fs = {"cf_1": filing("cf_1"), "cf_2": filing("cf_2", filer_identity_id="csi_b", filer_name_raw="Committee B", source_hash="y" * 64)}
         d = self.run_dups(fs, self.rows("cf_1", 8) + self.rows("cf_2", 8, base=100))
         self.assertEqual(d, {})
 
@@ -237,6 +282,43 @@ class TestDuplicates(unittest.TestCase):
         ek = {"jurisdiction-testville": {(r["schedule_code"], r["amount_minor"], r["transaction_date"]) for r in rows}}
         d = self.run_dups(fs, rows, ek)
         self.assertEqual(d["cf_1"][0], "duplicate_of_efile")
+
+
+    def test_same_document_pages_is_one_statement(self):
+        fs = {"cf_1": filing("cf_1"), "cf_2": filing("cf_2", filer_identity_id="csi_b", filer_name_raw="Committee B")}
+        d = self.run_dups(fs, self.rows("cf_1", 8) + self.rows("cf_2", 8, base=100))
+        self.assertEqual({k: v[0] for k, v in d.items()}, {"cf_1": "amendment_order_unknown", "cf_2": "amendment_order_unknown"})
+
+    def test_contained_period_superseded_when_amounts_match(self):
+        fs = {"cf_1": filing("cf_1", source_hash="a" * 64), "cf_2": filing("cf_2", period_end="2018-02-24", source_hash="b" * 64)}
+        big = self.rows("cf_1", 8)
+        small = [dict(r, id=r["id"] + "s", filing_id="cf_2") for r in big[:3]]
+        d = self.run_dups(fs, big + small)
+        self.assertEqual(d, {"cf_2": ("superseded_by_containing_period", "cf_1")})
+
+    def test_near_period_is_same_period(self):
+        self.assertTrue(R.near_period(("2016-02-28", "2016-03-26"), ("2016-02-29", "2016-03-27")))
+        self.assertFalse(R.near_period(("2016-01-01", "2016-06-30"), ("2016-01-01", "2016-04-12")))
+
+    def test_tie_goes_to_copy_check(self):
+        fs = {"cf_1": filing("cf_1", source_hash="a" * 64), "cf_2": filing("cf_2", source_hash="b" * 64)}
+        by = defaultdict(list)
+        for r in self.rows("cf_1", 8) + self.rows("cf_2", 9):
+            by[r["filing_id"]].append(r)
+        pend = {}
+        d = R.dup_groups(fs, by, {}, pending=pend)
+        self.assertEqual(d, {})
+        self.assertEqual(pend, {"cf_1": ["cf_1", "cf_2"], "cf_2": ["cf_1", "cf_2"]})
+        ck = {s: {"itemized": v} for s, v in zip("ACE", (100, 0, 50))}
+        res = {"cf_1": {"verdict": "FLAG", "fail": ["A:rows_do_not_reconcile"], "checks": dict(ck), "corrections": [], "drop": []},
+               "cf_2": {"verdict": "PASS", "fail": [], "checks": dict(ck), "corrections": [], "drop": []}}
+        R.resolve_copies(pend, res, {})
+        self.assertEqual((res["cf_1"]["verdict"], res["cf_1"]["fail"][0]), ("FLAG", "same_statement_copy"))
+        self.assertEqual(res["cf_2"]["verdict"], "PASS")
+        res["cf_1"]["checks"] = {s: {"itemized": v} for s, v in zip("ACE", (101, 0, 50))}
+        res["cf_2"] = {"verdict": "PASS", "fail": [], "checks": dict(ck), "corrections": [], "drop": []}
+        R.resolve_copies(pend, res, {})
+        self.assertEqual((res["cf_2"]["verdict"], res["cf_2"]["fail"][0]), ("FLAG", "amendment_order_unknown"))
 
 
 class TestMisc(unittest.TestCase):
