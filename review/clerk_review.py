@@ -91,6 +91,20 @@ def row_page(r):
         return None
 
 
+FORM_TEXT = re.compile(r"^\W*(of\s*bu\w*|from\b|form\b|sched|name\b|page\b|sub\s*total|amount|date\b|received|statement|cumulative|"
+                       r"contributor|per\s*election|to\s*date|calendar|full\s*name|street|address|if\s+an|occupation|employer|"
+                       r"code\b|description|payee|total\b)", re.I)
+
+
+def form_text_name(n):
+    """A row 'name' that is really a piece of the printed form (column heading, label) or a few stray glyphs.
+    An empty name is not form text: the row counts in totals and simply carries no donor identity."""
+    n = (n or "").strip()
+    if not n:
+        return False
+    return len(re.findall(r"[A-Za-z]", n)) < 3 or bool(FORM_TEXT.search(n))
+
+
 def rows_fp(rows):
     h = hashlib.sha256()
     for r in sorted(rows, key=lambda r: r["id"]):
@@ -167,7 +181,10 @@ def review_filing(f, rows, pages, deadline):
                         raise Deadline()
                     if F.find_box(pages.read("B", slug, sha, key, p) or "", s) is not None:
                         box_pages.append(p)
-        chk = {"rows": len(srows), "null_rows": sum(r["amount_minor"] is None for r in srows),
+        junk = [r["id"] for r in srows if (r["amount_minor"] or 0) > 0 and form_text_name(r["counterparty_name_raw"])]
+        if junk:
+            res["fail"].append(f"{s}:row_name_is_form_text")
+        chk = {"rows": len(srows), "null_rows": sum(r["amount_minor"] is None for r in srows), "form_text_names": len(junk),
                "rows_sum": sum(r["amount_minor"] or 0 for r in srows)}
         if not box_pages:
             chk["itemized"] = 0 if not srows else None
@@ -480,11 +497,15 @@ def main():
             todo.append(fid)
 
     log(f'loaded {len(filings)} filings; todo {len(todo)} reapply {len(reapply)}')
-    prefetch(todo, filings, pages, deadline)
+    prefetch([f for f in todo if f not in dups], filings, pages, deadline)
     log(f'prefetch done ocr={pages.stats}')
     results, deferred = {}, []
     for fid in todo:
         f = filings[fid]
+        if fid in dups:                       # a duplicate / superseded / overlapping filing never counts: no reads needed
+            results[fid] = {"filing_id": fid, "jurisdiction_id": f["jurisdiction_id"], "verdict": "FLAG", "corrections": [], "drop": [],
+                            "fail": [dups[fid][0]], "gap": {}, "checks": {"duplicate": {"reason": dups[fid][0], "other": dups[fid][1]}}}
+            continue
         try:
             r = review_filing(f, rows_by[fid], pages, deadline)
         except Deadline:
@@ -533,8 +554,8 @@ def main():
             if t["record_state"] != "OCR_UNREVIEWED" or t["id"] in dropped:
                 continue
             amt = corr_amt.get(t["id"], t["amount_minor"])
-            if amt is None:
-                continue                      # a row with no amount stays unreviewed
+            if amt is None or amt <= 0:
+                continue                      # a row with no (or a zero) amount stays unreviewed
             flips[fid].append(t["id"])
             k = {"460A": "raised_minor", "460E": "spent_minor", "460C": "nonmonetary_minor"}.get(t["schedule_code"])
             if not k:
@@ -579,7 +600,11 @@ def main():
     corrections = [{"filing_id": fid, **c} for fid, r in results.items() if r["verdict"] == "CORRECTED_PASS"
                    for c in r["corrections"] + r["drop"]]
 
-    report = {"run_id": run_id, "started_at": started, "dry_run": args.dry_run, "places": place,
+    passed = [{"filing_id": fid, "place": slug_of(r["jurisdiction_id"]), "verdict": r["verdict"], "reapply": bool(r.get("reapply")),
+               "rows_flipped": len(flips.get(fid, [])),
+               **{f"{s}_itemized_minor": r["checks"].get(s, {}).get("itemized") for s in "ACE"}}
+              for fid, r in sorted(results.items()) if r["verdict"] != "FLAG"]
+    report = {"run_id": run_id, "passed": passed, "started_at": started, "dry_run": args.dry_run, "places": place,
               "deferred_filings": deferred, "year_moves": moves, "f496_2022_touched": f496_2022,
               "flags": flags, "corrections": corrections, "ocr": pages.stats}
 

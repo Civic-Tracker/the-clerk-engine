@@ -3,3 +3,4 @@ __pycache__/
 reports/run-*.json
 .env
 .cache/
+reports/clerk-review-*.json

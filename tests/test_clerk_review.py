@@ -161,7 +161,7 @@ class TestReview(unittest.TestCase):
         self.assertEqual(r["corrections"][0]["after"], 45000)
 
     def test_drop_doubled_row(self):
-        rows = [row(1, "460A", 1693000 - 50000), row(2, "460A", 50000, name="X"), row(3, "460A", 50000, name="X")]
+        rows = [row(1, "460A", 1693000 - 50000), row(2, "460A", 50000, name="Pat Lee"), row(3, "460A", 50000, name="Pat Lee")]
         r = R.review_filing(filing(), rows, self.pages(BOX_A), deadline=9e18)
         self.assertEqual(r["fail"], [])
         self.assertEqual(r["drop"][0]["rule"], "drop_duplicate_row")
@@ -180,6 +180,20 @@ class TestReview(unittest.TestCase):
         p = FakePages({1: blank, 2: BOX_A, 3: blank})
         r = R.review_filing(filing(), [row(1, "460A", 1693000)], p, deadline=9e18)
         self.assertEqual(r["fail"], [])
+
+
+class TestNames(unittest.TestCase):
+    def test_form_text(self):
+        for n in ["OF BUSINESS)", "NAME AND ADDRESS OF PAYEE", "El", "(", "Schedule A (Continuation Sheet)"]:
+            self.assertTrue(R.form_text_name(n), n)
+        for n in ["", None, "Michael Abrams", "SUTTON LAW FIRM", "Ng, Al"]:
+            self.assertFalse(R.form_text_name(n), n)
+
+    def test_form_text_row_flags(self):
+        rows = [row(1, "460A", 1693000, name="OF BUSINESS)")]
+        a = {1: "Summary Page", 2: BOX_A, 3: ""}
+        r = R.review_filing(filing(), rows, FakePages(a), deadline=9e18)
+        self.assertIn("A:row_name_is_form_text", r["fail"])
 
 
 class TestDuplicates(unittest.TestCase):
