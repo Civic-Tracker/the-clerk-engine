@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 reports/run-*.json
 .env
+.cache/

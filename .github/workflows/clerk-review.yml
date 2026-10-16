@@ -1,0 +1,72 @@
+name: clerk-review
+# The Clerk Engine: clerk review of OCR'd campaign money, STAGING ONLY (staging D1 5caedb62 + read-only staging R2).
+# Reads each scanned Form 460's schedule summary boxes twice, reconciles the OCR rows to them, rules out duplicates
+# and superseded amendments, fixes only evidence-backed OCR misreads, and moves passing rows OCR_UNREVIEWED -> ACTIVE
+# (logged per run; revert with --revert RUN_ID). A place's batch is held on a major discrepancy.
+# Nightly 06:23 UTC (11:23 PM PDT / 10:23 PM PST): done before the Official App's 12:15 AM PT refresh.
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+    inputs:
+      places:
+        description: "comma-separated place slugs"
+        required: false
+        default: "beverlyhills,culvercity"
+      dry_run:
+        description: "review and report only (no writes)"
+        type: boolean
+        required: false
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: clerk-review
+  cancel-in-progress: false
+jobs:
+  review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Guard - token present
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            msg="Repo secret CLOUDFLARE_API_TOKEN is not set. Nothing was read or written."
+            echo "::error::$msg"
+            printf '## Clerk review\n\n**FAILED - config: %s**\n' "$msg" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+      - name: Tests
+        run: python3 -m unittest discover -s tests
+      - name: OCR tools (tesseract, poppler)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tesseract-ocr poppler-utils > /dev/null
+      - name: OCR read cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/clerk-review
+          key: clerk-review-${{ github.run_id }}
+          restore-keys: clerk-review-
+      - name: Clerk review -> staging
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PLACES: ${{ github.event.inputs.places || 'beverlyhills,culvercity' }}
+          DRY: ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
+        run: |
+          mkdir -p reports
+          rm -rf .cache/clerk-review/pdf   # PDFs are re-fetched; only OCR text is cached
+          python3 review/clerk_review.py --places "$PLACES" --max-seconds 2400 $DRY \
+            --cache-dir .cache/clerk-review --report "reports/clerk-review-$(date -u +%Y%m%dT%H%M).json"
+      - name: Report (ids and counts only)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clerk-review-report
+          path: reports/clerk-review-*.json
+          if-no-files-found: ignore
+          retention-days: 30

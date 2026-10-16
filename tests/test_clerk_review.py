@@ -1,0 +1,246 @@
+"""Clerk review: box reading, reconcile, clerk fixes, duplicates, major-discrepancy hold. Stdlib, no network."""
+import os, sys, unittest
+from collections import defaultdict
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "lib"))
+sys.path.insert(0, os.path.join(HERE, "..", "review"))
+import form460 as F  # noqa: E402
+import clerk_review as R  # noqa: E402
+
+BOX_A = """SUBTOTAL $ 1,650.00
+Schedule A Summary                                                    *Contributor Codes
+1. Amount received this period - itemized monetary contributions.
+   (Include all Schedule A subtotals.)                   $ 16,930.00   COM Recipient Committee
+2. Amount received this period - unitemized monetary contributions of less than $100     $ 105.00
+3. Total monetary contributions received this period.
+   (Add Lines 1 and 2. Enter here and on the Summary Page, Column A, Line 1.)   TOTAL $ 17,035.00
+FPPC Form 460 (Jan/2016)
+"""
+
+BOX_E = """Schedule E Summary
+1. Itemized payments made this period. (Include all Schedule E subtotals.) ........ $37,338.80
+2. Unitemized payments made this period of under $100. ........ $ 881.23
+3. Total interest paid this period on loans. (Enter amount from Schedule B, Part 1, Column (e).) .... $0.00
+4. Total payments made this period. (Add Lines 1, 2, and 3. Enter here and on the Summary Page, Column A, Line 6.) TOTAL $38,220.03
+FPPC Form 460 (Jan/2016)
+"""
+
+BOX_E_DROPPED = BOX_E.replace("$ 881.23", "")          # OCR lost line 2's amount
+
+
+class FakePages:
+    """Pages stand-in: read A / B / C texts per page."""
+    def __init__(self, a, b=None, c=None):
+        self.t = {"A": a, "B": b or a, "C": c or a}
+        self.calls = defaultdict(int)
+
+    def read_a(self, slug, sha, key, p):
+        return self.t["A"].get(p, "")
+
+    def read(self, which, slug, sha, key, p, box=False):
+        self.calls[which] += 1
+        return self.t[which].get(p, "")
+
+    def cached(self, which, sha, p):
+        return True
+
+    def pages_of(self, slug, sha, key):
+        return max(self.t["A"])
+
+
+def filing(fid="cf_1", **kw):
+    f = {"id": fid, "jurisdiction_id": "jurisdiction-testville", "filer_identity_id": "csi_a", "filer_name_raw": "Committee A",
+         "form_number": "460", "amendment_number": 0, "filing_date": None, "period_start": "2018-01-01", "period_end": "2018-06-30",
+         "cycle_year": 2018, "record_state": "ACTIVE", "evidence_r2_key": "raw/testville/x.pdf", "source_hash": "x" * 64,
+         "raw_json": '{"source_url": "https://example.test/doc#pages=1-3"}'}
+    f.update(kw)
+    return f
+
+
+def row(i, sched, amt, page=2, date="2018-02-01", name=None, state="OCR_UNREVIEWED"):
+    return {"id": f"ct_{i}", "jurisdiction_id": "jurisdiction-testville", "filing_id": "cf_1", "schedule_code": sched,
+            "transaction_kind": "CONTRIBUTION", "amount_minor": amt, "transaction_date": date, "record_state": state,
+            "provenance": "ocr", "counterparty_name_raw": name or f"Donor {i}", "cycle_year": 2018,
+            "raw_json": f'{{"page": {page}}}'}
+
+
+class TestForm460(unittest.TestCase):
+    def test_money_tokens(self):
+        self.assertEqual(F.cents_tokens("$16,930.00 and 105.00 and -0-"), [1693000, 10500, 0])
+        self.assertEqual(F.cents_tokens("TOTAL $3,200"), [320000])
+
+    def test_box_a(self):
+        r = F.read_box(BOX_A, "A")
+        self.assertEqual(r["lines"], [1693000, 10500, 1703500])
+        self.assertTrue(r["arith"])
+
+    def test_box_e(self):
+        r = F.read_box(BOX_E, "E")
+        self.assertEqual(r["lines"], [3733880, 88123, 0, 3822003])
+        self.assertTrue(r["arith"])
+
+    def test_box_e_dropped_line(self):
+        r = F.read_box(BOX_E_DROPPED, "E")
+        self.assertEqual(r["lines"][0], 3733880)        # line 1 still read
+        self.assertFalse(r["arith"])
+
+    def test_no_box(self):
+        self.assertIsNone(F.read_box("Schedule A (Continuation Sheet)\nfoo 100.00", "A"))
+
+    def test_misread_variants(self):
+        v = F.misread_variants(45000)
+        self.assertIn(4500, v)          # decimal slip
+        self.assertIn(450000, v)
+        self.assertIn(48000, v)         # 5 -> 8 confusable
+        self.assertIn(54000, v)         # transposition
+        self.assertNotIn(45000, v)
+
+    def test_text_has_amount(self):
+        self.assertTrue(F.text_has_amount("Jane Doe  1,250.00  1,250.00", 125000))
+        self.assertFalse(F.text_has_amount("Jane Doe  1,520.00", 125000))
+
+
+class TestReview(unittest.TestCase):
+    def pages(self, box_page_text, b=None, extra=None):
+        a = {1: "Campaign Disclosure Statement Summary Page", 2: box_page_text, 3: "Schedule E Payments Made"}
+        a.update(extra or {})
+        bb = dict(a)
+        if b is not None:
+            bb[2] = b
+        return FakePages(a, bb)
+
+    def test_pass_when_rows_reconcile(self):
+        rows = [row(1, "460A", 1000000), row(2, "460A", 693000)]
+        r = R.review_filing(filing(), rows, self.pages(BOX_A), deadline=9e18)
+        self.assertEqual(r["fail"], [])
+        self.assertEqual(r["checks"]["A"]["itemized"], 1693000)
+
+    def test_flag_when_reads_disagree(self):
+        b = BOX_A.replace("16,930.00", "18,930.00").replace("17,035.00", "19,035.00")
+        c = BOX_A.replace("16,930.00", "16,980.00")
+        p = self.pages(BOX_A, b=b)
+        p.t["C"] = dict(p.t["A"]); p.t["C"][2] = c
+        rows = [row(1, "460A", 1693000)]
+        r = R.review_filing(filing(), rows, p, deadline=9e18)
+        self.assertIn("A:summary_reads_disagree", r["fail"])
+
+    def test_tiebreak_read_c(self):
+        b = BOX_A.replace("16,930.00", "18,930.00")
+        p = self.pages(BOX_A, b=b)          # read C (default = A text) agrees with A -> 2 of 3
+        r = R.review_filing(filing(), [row(1, "460A", 1693000)], p, deadline=9e18)
+        self.assertEqual(r["fail"], [])
+        self.assertEqual(p.calls["C"], 1)
+
+    def test_flag_when_rows_short_and_no_evidence(self):
+        rows = [row(1, "460A", 1000000), row(2, "460A", 600000)]
+        r = R.review_filing(filing(), rows, self.pages(BOX_A), deadline=9e18)
+        self.assertIn("A:rows_do_not_reconcile", r["fail"])
+        self.assertEqual(r["gap"]["A"], -93000)
+
+    def test_fix_decimal_slip_with_evidence(self):
+        page2 = BOX_A.replace("SUBTOTAL", "Jane Doe IND  6,930.00\nSUBTOTAL")
+        rows = [row(1, "460A", 1000000), row(2, "460A", 69300)]       # 6,930.00 read as 693.00
+        r = R.review_filing(filing(), rows, self.pages(page2), deadline=9e18)
+        self.assertEqual(r["fail"], [])
+        self.assertEqual(r["corrections"][0]["rule"], "fix_misread_amount")
+        self.assertEqual((r["corrections"][0]["before"], r["corrections"][0]["after"]), (69300, 693000))
+
+    def test_no_fix_without_printed_value(self):
+        rows = [row(1, "460A", 1000000), row(2, "460A", 69300)]       # 6,930.00 not printed in any read
+        r = R.review_filing(filing(), rows, self.pages(BOX_A), deadline=9e18)
+        self.assertIn("A:rows_do_not_reconcile", r["fail"])
+        self.assertEqual(r["corrections"], [])
+
+    def test_fill_unread_amount(self):
+        page2 = BOX_A.replace("SUBTOTAL", "John Roe IND 450.00\nSUBTOTAL")
+        rows = [row(1, "460A", 1648000), row(2, "460A", None)]
+        r = R.review_filing(filing(), rows, self.pages(page2), deadline=9e18)
+        self.assertEqual(r["fail"], [])
+        self.assertEqual(r["corrections"][0]["rule"], "fill_unread_amount")
+        self.assertEqual(r["corrections"][0]["after"], 45000)
+
+    def test_drop_doubled_row(self):
+        rows = [row(1, "460A", 1693000 - 50000), row(2, "460A", 50000, name="X"), row(3, "460A", 50000, name="X")]
+        r = R.review_filing(filing(), rows, self.pages(BOX_A), deadline=9e18)
+        self.assertEqual(r["fail"], [])
+        self.assertEqual(r["drop"][0]["rule"], "drop_duplicate_row")
+
+    def test_missing_schedule_is_zero(self):
+        r = R.review_filing(filing(), [], self.pages("Schedule B Loans"), deadline=9e18)
+        self.assertEqual(r["fail"], [])
+        self.assertEqual(r["checks"]["A"]["itemized"], 0)
+
+    def test_rows_without_box_flag(self):
+        r = R.review_filing(filing(), [row(1, "460E", 5000)], self.pages("nothing here"), deadline=9e18)
+        self.assertIn("E:no_summary_box", r["fail"])
+
+    def test_photocopied_blank_boxes_ignored(self):
+        blank = BOX_A.replace("16,930.00", "").replace("105.00", "").replace("17,035.00", "")
+        p = FakePages({1: blank, 2: BOX_A, 3: blank})
+        r = R.review_filing(filing(), [row(1, "460A", 1693000)], p, deadline=9e18)
+        self.assertEqual(r["fail"], [])
+
+
+class TestDuplicates(unittest.TestCase):
+    def setUp(self):
+        self.rows = lambda fid, n, base=0: [dict(row(i + base, "460A", 10000 + i + base * 100, date=f"2018-02-{(i % 27) + 1:02d}"), filing_id=fid) for i in range(n)]
+
+    def run_dups(self, filings, rows, efile=None):
+        by = defaultdict(list)
+        for r in rows:
+            by[r["filing_id"]].append(r)
+        return R.dup_groups(filings, by, efile or {})
+
+    def test_identical_copy(self):
+        fs = {"cf_1": filing("cf_1"), "cf_2": filing("cf_2")}
+        d = self.run_dups(fs, self.rows("cf_1", 8) + self.rows("cf_2", 8))
+        self.assertEqual(d, {"cf_2": ("duplicate_copy", "cf_1")})
+
+    def test_amendment_wins(self):
+        fs = {"cf_1": filing("cf_1"), "cf_2": filing("cf_2", amendment_number=1)}
+        d = self.run_dups(fs, self.rows("cf_1", 8) + self.rows("cf_2", 9))
+        self.assertEqual(d, {"cf_1": ("superseded_by_amendment", "cf_2")})
+
+    def test_unknown_order_flags_both(self):
+        fs = {"cf_1": filing("cf_1"), "cf_2": filing("cf_2")}
+        d = self.run_dups(fs, self.rows("cf_1", 8) + self.rows("cf_2", 9))
+        self.assertEqual({k: v[0] for k, v in d.items()}, {"cf_1": "amendment_order_unknown", "cf_2": "amendment_order_unknown"})
+
+    def test_overlapping_periods_same_committee(self):
+        fs = {"cf_1": filing("cf_1"), "cf_2": filing("cf_2", period_start="2018-01-01", period_end="2018-02-24")}
+        d = self.run_dups(fs, self.rows("cf_1", 8) + self.rows("cf_2", 3, base=50))
+        self.assertEqual({k: v[0] for k, v in d.items()}, {"cf_1": "overlapping_periods", "cf_2": "overlapping_periods"})
+
+    def test_different_committees_differnt_rows_ok(self):
+        fs = {"cf_1": filing("cf_1"), "cf_2": filing("cf_2", filer_identity_id="csi_b", filer_name_raw="Committee B")}
+        d = self.run_dups(fs, self.rows("cf_1", 8) + self.rows("cf_2", 8, base=100))
+        self.assertEqual(d, {})
+
+    def test_efile_duplicate(self):
+        fs = {"cf_1": filing("cf_1")}
+        rows = self.rows("cf_1", 6)
+        ek = {"jurisdiction-testville": {(r["schedule_code"], r["amount_minor"], r["transaction_date"]) for r in rows}}
+        d = self.run_dups(fs, rows, ek)
+        self.assertEqual(d["cf_1"][0], "duplicate_of_efile")
+
+
+class TestMisc(unittest.TestCase):
+    def test_page_range(self):
+        self.assertEqual(R.page_range(filing(), lambda: 99), (1, 3))
+        self.assertEqual(R.page_range(filing(raw_json="{}"), lambda: 7), (1, 7))
+
+    def test_rows_fp_stable(self):
+        a = [row(1, "460A", 100), row(2, "460E", 200)]
+        self.assertEqual(R.rows_fp(a), R.rows_fp(list(reversed(a))))
+        self.assertNotEqual(R.rows_fp(a), R.rows_fp([row(1, "460A", 101), row(2, "460E", 200)]))
+
+    def test_staging_guard(self):
+        import d1
+        os.environ.setdefault("CLOUDFLARE_API_TOKEN", "x")
+        with self.assertRaises(SystemExit):
+            d1.D1(db="726f7c4e-4fce-4a10-8a31-d804ee000b79")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -20,6 +20,9 @@ Free-tier scripts that do Civic Tracker's repeat grind (fetch, fingerprint, diff
 | `.github/workflows/netfile-nightly.yml` | Nightly 09:17 UTC + manual dispatch; per-city table on the run page (job summary); uploads the JSON report as an artifact. |
 | `reports/` | Dry-run summary. Nightly JSON reports go to Actions artifacts (gitignored). |
 | `docs/STEP2-mail-intake.md` | What Step 2 (Apps Script mail intake) needs. |
+| `review/clerk_review.py` | Clerk review of OCR'd money (see below). Stdlib Python + tesseract/poppler. |
+| `lib/form460.py`, `lib/pages.py`, `lib/d1.py` | Form 460 box reading, page text reads (A/B/C), staging-only D1 client. |
+| `.github/workflows/clerk-review.yml` | Nightly 06:23 UTC (before the 12:15 AM PT Official App refresh) + manual dispatch. |
 
 ## NetFile adapter: what one run does
 1. Lists every campaign filing for each pack row: `netfile.com/api/public/sites/api/filings/byDate` (current + archived).
@@ -46,3 +49,29 @@ The nightly Action needs one repo secret, which could not be set without exposin
 Until it is set, the workflow fails fast at "Guard - token present" (no partial writes). This is what failed the first scheduled run on Oct 16, 2026. Then run it once by hand from the Actions tab.
 
 Free-tier note: private-repo Actions get 2,000 free minutes/month; a no-change nightly run over 5 cities takes ~1 minute.
+
+## Clerk review: what one run does
+Scanned Form 460s are OCR'd into staging D1 `campaign_transactions` as `record_state='OCR_UNREVIEWED'`, `provenance='ocr'`
+(never counted). `review/clerk_review.py` checks each filing the way a clerk would before it counts:
+
+1. **Two independent reads** of each Schedule A / C / E summary box (read A = the ingest's text; read B = fresh tesseract
+   psm 4; read C at 400 dpi breaks a tie, 2 of 3 must agree on line 1).
+2. **Reconcile**: OCR rows per schedule = that schedule's itemized line 1 (+/- $0.50). No box and no rows = 0.
+3. **Not a duplicate / not superseded**: same rows as another OCR filing or as ACTIVE e-filed rows, an earlier
+   amendment of the same filer + period, or overlapping periods of one committee are flagged.
+4. **Clerk fixes** (logged before/after in `clerk_corrections`): a decimal slip, confusable digit, transposition, a row
+   whose amount was not read, or a doubled row, fixed only when exactly one fix exists, the fixed value is printed on
+   that page in an OCR read, and the rows then reconcile to the cent.
+
+PASS / CORRECTED_PASS rows go `OCR_UNREVIEWED -> ACTIVE` (provenance stays `ocr`); every flip is in
+`clerk_review_flips` (per run). Verdicts are in `clerk_reviews`. A Time Travel bookmark is taken before any write.
+**Held batch**: a place gets no writes if a counted Raised/Spent total for a (place, year) that already has counted money
+would move > 10% or > $250k, a filing is > 10x its committee's history, a passing filing overlaps ACTIVE e-filed rows,
+or a non-460 row is in the batch. Years with no counted money yet are new coverage, not a move (reported per year).
+Unresolved filings stay `OCR_UNREVIEWED`; the run report (ids and counts only) lists them with the gap and reason.
+
+Nightly runs only look at new or changed filings (row fingerprint) and re-apply standing verdicts if a re-promote
+reset the rows. Revert a run: `python3 review/clerk_review.py --revert <run_id>`.
+```
+CLOUDFLARE_API_TOKEN=... python3 review/clerk_review.py --places beverlyhills,culvercity [--dry-run] [--max-seconds N]
+```
