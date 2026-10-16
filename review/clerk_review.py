@@ -530,8 +530,9 @@ def main():
     base = defaultdict(int)                 # (jid, year, sched) -> counted cents now
     for r in ef:
         base[(r["jurisdiction_id"], r["cycle_year"], r["schedule_code"])] += r["amount_minor"] or 0
-    corr_amt = {c["transaction_id"]: c["after"] for r in results.values() for c in r["corrections"]}
-    dropped = {c["transaction_id"] for r in results.values() for c in r["drop"]}
+    # fixes only exist for filings that pass; a flagged filing's candidate fixes are never applied
+    corr_amt = {c["transaction_id"]: c["after"] for r in results.values() if r["verdict"] != "FLAG" for c in r["corrections"]}
+    dropped = {c["transaction_id"] for r in results.values() if r["verdict"] != "FLAG" for c in r["drop"]}
     place = {p: {"reviewed": 0, "PASS": 0, "CORRECTED_PASS": 0, "FLAG": 0, "deferred": 0, "reapplied": 0,
                  "flip_rows": 0, "raised_minor": 0, "spent_minor": 0, "nonmonetary_minor": 0, "held": False,
                  "hold_reasons": []} for p in places}
