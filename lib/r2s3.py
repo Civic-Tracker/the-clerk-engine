@@ -7,21 +7,63 @@ Usage: r2s3.py put <bucket> <key> <file> <meta-json>   (If-None-Match:* -> never
 """
 import sys, os, json, hashlib, hmac, base64, datetime, urllib.request, urllib.parse, urllib.error
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import net
+
 ACCT = "1237f978938188ed96dc859fdd2d40d0"
 HOST = f"{ACCT}.r2.cloudflarestorage.com"
-TOK = os.environ["CLOUDFLARE_API_TOKEN"]
+CF = "https://api.cloudflare.com/client/v4"
 
+
+def tok():
+    """Read the token when needed (not at import), so a missing secret is a clear error, not a KeyError on import."""
+    t = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+    if not t:
+        raise net.AuthError("CLOUDFLARE_API_TOKEN is not set")
+    return t
+
+
+def cf(method, path, body=None):
+    """Cloudflare API call with retries (429/5xx/timeouts). 401/403 -> AuthError."""
+    data = json.dumps(body).encode() if body is not None else None
+    hd = {"Authorization": f"Bearer {tok()}"}
+    if data is not None:
+        hd["content-type"] = "application/json"
+    s, _, b = net.request(urllib.request.Request(CF + path, data=data, method=method, headers=hd), timeout=60)
+    try:
+        j = json.loads(b or b"{}")
+    except ValueError:
+        j = {}
+    if s in (401, 403):
+        raise net.AuthError(f"Cloudflare {path.split('?')[0]} HTTP {s}: {json.dumps(j.get('errors'))[:160]}")
+    if s != 200 or not j.get("success"):
+        raise RuntimeError(f"Cloudflare {path.split('?')[0]} HTTP {s}: {json.dumps(j.get('errors'))[:160]}")
+    return j["result"]
+
+
+_TOKEN_ID = None
 def token_id():
-    r = urllib.request.Request("https://api.cloudflare.com/client/v4/user/tokens/verify",
-                               headers={"Authorization": f"Bearer {TOK}"})
-    return json.load(urllib.request.urlopen(r))["result"]["id"]
+    """Id of the API token (= R2 parent access key). User tokens verify at /user/tokens/verify,
+    account-owned tokens at /accounts/<id>/tokens/verify; try both."""
+    global _TOKEN_ID
+    if _TOKEN_ID:
+        return _TOKEN_ID
+    errs = []
+    for path in ("/user/tokens/verify", f"/accounts/{ACCT}/tokens/verify"):
+        try:
+            _TOKEN_ID = cf("GET", path)["id"]
+            return _TOKEN_ID
+        except (net.AuthError, RuntimeError) as e:
+            errs.append(str(e)[:120])
+    raise net.AuthError("token verify failed: " + " | ".join(errs))
+
 
 def temp_creds(bucket, prefix, perm="object-read-write"):
-    body = json.dumps({"bucket": bucket, "parentAccessKeyId": token_id(), "permission": perm,
-                       "ttlSeconds": 900, "prefixes": [prefix]}).encode()
-    r = urllib.request.Request(f"https://api.cloudflare.com/client/v4/accounts/{ACCT}/r2/temp-access-credentials",
-        data=body, method="POST", headers={"Authorization": f"Bearer {TOK}", "content-type": "application/json"})
-    j = json.load(urllib.request.urlopen(r))["result"]
+    try:
+        j = cf("POST", f"/accounts/{ACCT}/r2/temp-access-credentials",
+               {"bucket": bucket, "parentAccessKeyId": token_id(), "permission": perm, "ttlSeconds": 900, "prefixes": [prefix]})
+    except net.AuthError as e:
+        raise net.AuthError(f"R2 temp credentials refused (token needs Account > Workers R2 Storage > Edit): {e}")
     return j["accessKeyId"], j["secretAccessKey"], j["sessionToken"]
 
 AK = SK = ST = None
@@ -48,13 +90,22 @@ def sign(method, bucket, key, headers, payload_hash):
 
 def req(method, bucket, key, headers=None, body=b""):
     ph = hashlib.sha256(body).hexdigest()
-    url, h = sign(method, bucket, key, headers or {}, ph)
-    r = urllib.request.Request(url, data=body if method == "PUT" else None, method=method, headers=h)
-    try:
-        resp = urllib.request.urlopen(r, timeout=120)
-        return resp.status, dict(resp.headers), resp.read()
-    except urllib.error.HTTPError as e:
-        return e.code, dict(e.headers), e.read()
+    # Retries 429/5xx/timeouts. Each attempt re-signs (fresh x-amz-date). 412 (exists) / 404 / 403 come straight back.
+    last = None
+    for attempt in range(5):
+        url, h = sign(method, bucket, key, headers or {}, ph)
+        r = urllib.request.Request(url, data=body if method == "PUT" else None, method=method, headers=h)
+        try:
+            s, hd, out = net.request(r, timeout=120, tries=1)
+        except RuntimeError as e:
+            last = str(e)
+        else:
+            if s not in net.RETRY_STATUS:
+                return s, dict(hd or {}), out
+            last = f"HTTP {s}"
+        if attempt < 4:
+            net.time.sleep(net.backoff(attempt))
+    raise RuntimeError(f"R2 {method} {key[-40:]} failed after 5 tries: {last}")
 
 if __name__ == "__main__":
     cmd = sys.argv[1]

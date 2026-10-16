@@ -15,6 +15,8 @@ import argparse, datetime, hashlib, json, os, sys, time, urllib.request, urllib.
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "lib"))
+import net
+from net import AuthError
 
 UA = "CivicTracker-Clerk/0.1 (+https://civictracker.app; public campaign filings)"
 LIST = "https://netfile.com/api/public/sites/api/filings/byDate?agencyCode={a}&startDate=1990-01-01&endDate=2100-01-01&page={p}&pageSize={n}&isArchived={ar}&isOnlyCampaign=true"
@@ -23,20 +25,15 @@ PROD_D1_GUARD = {"5caedb62-49c2-437b-a87a-b85923911ad3"}   # staging D1 is the o
 STAGING_BUCKETS = {"civic-tracker-bakeoff-evidence"}
 
 
-def http(url, accept="application/json", timeout=90, tries=3):
-    last = None
-    for i in range(tries):
-        try:
-            r = urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA, "Accept": accept}), timeout=timeout)
-            return r.status, r.headers.get("content-type", ""), r.read()
-        except urllib.error.HTTPError as e:
-            if e.code in (404, 403, 410) or (e.code == 500 and accept == "application/pdf"):  # 500 ImageNotFoundException = no image on file
-                return e.code, "", b""
-            last = e
-        except Exception as e:  # network blip
-            last = e
-        time.sleep(2 * (i + 1))
-    raise RuntimeError(f"GET failed after {tries}: {str(last)[:120]}")
+def http(url, accept="application/json", timeout=90, tries=5):
+    """NetFile GET with exponential backoff + jitter on 429/5xx/timeouts (lib/net.py).
+    PDF 500 = ImageNotFoundException (no image on file): returned at once, never retried."""
+    pdf = accept == "application/pdf"
+    s, h, b = net.request(urllib.request.Request(url, headers={"User-Agent": UA, "Accept": accept}), timeout=timeout,
+                          tries=tries, no_retry=lambda code: pdf and code == 500)
+    if s != 200:
+        return s, "", b""
+    return s, (h.get("content-type", "") if h else ""), b
 
 
 def list_filings(agency):
@@ -63,14 +60,23 @@ class D1:
             raise SystemExit(f"refusing: D1 {db} is not the staging database")
         self.url = f"https://api.cloudflare.com/client/v4/accounts/{acct}/d1/database/{db}/query"
         self.tok = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+        if not self.tok:
+            raise AuthError("CLOUDFLARE_API_TOKEN is not set")
 
     def q(self, sql, params=None):
+        """D1 query with retries on 429/5xx/timeouts. Statements here are SELECT or INSERT OR IGNORE, so a retry is idempotent."""
         body = json.dumps({"sql": sql, "params": params} if params else {"sql": sql}).encode()
         r = urllib.request.Request(self.url, data=body, method="POST",
                                    headers={"Authorization": f"Bearer {self.tok}", "content-type": "application/json"})
-        j = json.load(urllib.request.urlopen(r, timeout=90))
-        if not j.get("success"):
-            raise RuntimeError(f"D1 error: {json.dumps(j.get('errors'))[:200]}")
+        s, _, b = net.request(r, timeout=90)
+        try:
+            j = json.loads(b or b"{}")
+        except ValueError:
+            j = {}
+        if s in (401, 403):
+            raise AuthError(f"D1 HTTP {s} (token needs Account > D1 > Edit): {json.dumps(j.get('errors'))[:160]}")
+        if s != 200 or not j.get("success"):
+            raise RuntimeError(f"D1 HTTP {s}: {json.dumps(j.get('errors'))[:200]}")
         return j["result"]
 
 
@@ -158,6 +164,8 @@ def run_city(row, tgt, d1, args, deadline, rep):
                 + ", ".join(sqlq(v) for v in [f"nf_{agency.lower()}_{fid}", slug, source_key, fid, title,
                                                int(filed[:4]) if filed else None, IMAGE.format(id=fid), now, sha, len(body),
                                                key, "pending", "not-run", None, None, None, row["jurisdiction_id"]]) + ");")
+        except AuthError:
+            raise
         except Exception as e:
             c["errors"].append({"filing": fid, "why": str(e)[:160]})
         done += 1
@@ -183,26 +191,88 @@ def main():
     tgt = pack["target"]
     if tgt.get("env") != "staging" or tgt["r2_bucket"] not in STAGING_BUCKETS:
         raise SystemExit("refusing: pack target is not staging")
-    d1 = D1(tgt["account_id"], tgt["d1_database_id"])
-    only = set(filter(None, args.only.split(",")))
+    only = set(filter(None, (x.strip() for x in args.only.split(","))))
+    rows = [r for r in pack["jurisdictions"]
+            if r.get("platform") == "netfile" and r.get("enabled") and (not only or r["slug"] in only)]
+    unknown = only - {r["slug"] for r in rows}
     deadline = time.time() + args.max_seconds
     rep = json.load(open(args.report)) if os.path.exists(args.report) else {}
     rep.pop("_run", None)
-    for row in pack["jurisdictions"]:
-        if row.get("platform") != "netfile" or not row.get("enabled") or (only and row["slug"] not in only):
-            continue
+    status = {}   # slug -> (ok|failed|skipped, one-line reason)
+    fatal = None
+    if unknown:
+        fatal = f"config: --only names unknown/disabled slug(s): {', '.join(sorted(unknown))}"
+    elif not rows:
+        fatal = "config: no enabled netfile rows selected"
+    else:
+        try:  # preflight: token present + D1 reachable, so a bad secret fails once, loudly
+            d1 = D1(tgt["account_id"], tgt["d1_database_id"])
+            d1.q("SELECT 1")
+        except AuthError as e:
+            fatal = f"auth: {e}"
+        except Exception as e:
+            fatal = f"preflight: staging D1 unreachable: {str(e)[:160]}"
+    for row in ([] if fatal else rows):
+        slug = row["slug"]
         if time.time() > deadline:
-            break
+            status[slug] = ("skipped", "time box reached before this city")
+            continue
         try:
             run_city(row, tgt, d1, args, deadline, rep)
-        except Exception as e:
-            rep.setdefault(row["slug"], {"errors": []})["errors"].append({"city": str(e)[:200]})
-        print(row["slug"], json.dumps({k: v for k, v in rep.get(row["slug"], {}).items() if k != "errors"}),
-              "errors", len(rep.get(row["slug"], {}).get("errors", [])), flush=True)
-    rep["_run"] = {"finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "mode": "staging-dry-run"}
+            c = rep.get(slug, {})
+            n_err = len(c.get("errors", []))
+            status[slug] = ("ok", f"{c.get('d1_registered', 0)} registered, {c.get('stored_new_r2', 0)} new PDFs"
+                            + (f", {n_err} filing errors" if n_err else "") + (f", {c['remaining']} left for next run" if c.get("remaining") else ""))
+        except AuthError as e:  # bad/under-scoped token: every city would fail the same way
+            fatal = f"auth: {e}"
+            status[slug] = ("failed", str(e)[:160])
+            rep.setdefault(slug, {"errors": []}).setdefault("errors", []).append({"city": str(e)[:200]})
+            break
+        except Exception as e:  # one city fails alone; the rest still run
+            status[slug] = ("failed", str(e)[:160].replace("\n", " "))
+            rep.setdefault(slug, {"errors": []}).setdefault("errors", []).append({"city": str(e)[:200]})
+        print(slug, status[slug][0], json.dumps({k: v for k, v in rep.get(slug, {}).items() if k != "errors"}),
+              "errors", len(rep.get(slug, {}).get("errors", [])), flush=True)
+    for row in rows:
+        status.setdefault(row["slug"], ("skipped", "not run (stopped by auth error)" if fatal else "not run"))
+    ok = [s for s, (st, _) in status.items() if st == "ok"]
+    failed = [s for s, (st, _) in status.items() if st == "failed"]
+    if fatal:
+        exit_code, verdict = 2, f"FAILED - {fatal}"
+    elif rows and not ok:
+        exit_code, verdict = 1, "FAILED - every city failed"
+    else:
+        exit_code, verdict = 0, f"OK - {len(ok)} ok, {len(failed)} failed" + (" (see reasons)" if failed else "")
+    rep["_run"] = {"finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "mode": "staging-dry-run",
+                   "list_only": args.list_only, "verdict": verdict, "exit_code": exit_code,
+                   "cities": {s: {"status": st, "reason": why} for s, (st, why) in status.items()}}
     os.makedirs(os.path.dirname(args.report) or ".", exist_ok=True)
     json.dump(rep, open(args.report, "w"), indent=1)
+    write_summary(rep, status, verdict, args)
+    print(verdict, flush=True)
+    if fatal:
+        print(f"::error::{fatal}", flush=True)
+    for s in failed:
+        print(f"::warning::{s} failed: {status[s][1]}", flush=True)
+    return exit_code
+
+
+def write_summary(rep, status, verdict, args):
+    """Markdown table for the Actions run page ($GITHUB_STEP_SUMMARY); no-op locally."""
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    lines = [f"## Clerk Engine - NetFile -> staging{' (list only)' if args.list_only else ''}", "", f"**{verdict}**", "",
+             "| City | Status | Found | New | Registered | New PDFs | Note |", "|---|---|---|---|---|---|---|"]
+    for slug, (st, why) in status.items():
+        c = rep.get(slug, {})
+        icon = {"ok": "ok", "failed": "FAILED", "skipped": "skipped"}[st]
+        lines.append(f"| {slug} | {icon} | {c.get('filings_found', '')} | {c.get('new_listed', '')} | "
+                     f"{c.get('d1_registered', '')} | {c.get('stored_new_r2', '')} | {why.replace('|', '/')} |")
+    lines += ["", "Staging only (staging D1 + staging R2, hidden rows). Full JSON: artifact `clerk-netfile-report`."]
+    with open(path, "a") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
