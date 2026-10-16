@@ -1,0 +1,17 @@
+{
+  "_doc": "Jurisdiction pack: one row per place. Adding a city = adding a row. All rows here are HIDDEN on staging; nothing in this pack is ever published by the Clerk Engine.",
+  "target": {
+    "env": "staging",
+    "r2_bucket": "civic-tracker-bakeoff-evidence",
+    "r2_prefix": "raw",
+    "d1_database_id": "5caedb62-49c2-437b-a87a-b85923911ad3",
+    "account_id": "1237f978938188ed96dc859fdd2d40d0"
+  },
+  "jurisdictions": [
+    {"slug": "calabasas",    "name": "City of Calabasas",    "platform": "netfile", "agency": "CBS",  "jurisdiction_id": "jurisdiction-calabasas",    "enabled": true},
+    {"slug": "paramount",    "name": "City of Paramount",    "platform": "netfile", "agency": "PARA", "jurisdiction_id": "jurisdiction-paramount",    "enabled": true},
+    {"slug": "southgate",    "name": "City of South Gate",   "platform": "netfile", "agency": "SGC",  "jurisdiction_id": "jurisdiction-southgate",    "enabled": true},
+    {"slug": "hermosabeach", "name": "City of Hermosa Beach","platform": "netfile", "agency": "COHB", "jurisdiction_id": "jurisdiction-hermosabeach", "enabled": true},
+    {"slug": "elsegundo",    "name": "City of El Segundo",   "platform": "netfile", "agency": "SEG",  "jurisdiction_id": "jurisdiction-elsegundo",    "enabled": true}
+  ]
+}
