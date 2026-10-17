@@ -119,8 +119,8 @@ class TestRobotInReview(unittest.TestCase):
     def test_rebuilt_rows_settle_a_disagreeing_box(self):
         ws = sched_a_page([("02/01/2018", "Jane Doe", "10,000.00", "10,000.00"), ("02/02/2018", "John Roe", "6,930.00", "6,930.00")], "16,930.00")
         p = self.pages(ws)
-        p.t["B"] = dict(p.t["A"]); p.t["B"][2] = BOX_A.replace("16,930.00", "18,930.00")
-        p.t["C"] = dict(p.t["A"]); p.t["C"][2] = BOX_A.replace("16,930.00", "16,980.00")
+        p.t["B"] = dict(p.t["A"]); p.t["B"][2] = BOX_A.replace("16,930.00", "18,930.00").replace("17,035.00", "19,035.00")
+        p.t["C"] = dict(p.t["A"]); p.t["C"][2] = BOX_A.replace("16,930.00", "16,980.00").replace("17,035.00", "17,085.00")
         r = R.review_filing(filing(), [row(1, "460A", 1000000), row(2, "460A", 693000)], p, deadline=9e18)
         self.assertEqual(r["fail"], [])
         self.assertEqual(r["checks"]["A"]["settled_by"], "rebuilt_rows_match_one_read")

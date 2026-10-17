@@ -131,13 +131,33 @@ class TestReview(unittest.TestCase):
 
     def test_flag_when_reads_disagree(self):
         b = BOX_A.replace("16,930.00", "18,930.00").replace("17,035.00", "19,035.00")
-        c = BOX_A.replace("16,930.00", "16,980.00")
+        c = BOX_A.replace("16,930.00", "16,980.00").replace("17,035.00", "17,085.00")
         p = self.pages(BOX_A, b=b)
         p.t["C"] = dict(p.t["A"]); p.t["C"][2] = c
-        p.t["D"] = {2: BOX_A.replace("16,930.00", "16,830.00")}
+        p.t["D"] = {2: BOX_A.replace("16,930.00", "16,830.00").replace("17,035.00", "17,135.00")}
         rows = [row(1, "460A", 1693000)]
         r = R.review_filing(filing(), rows, p, deadline=9e18)
         self.assertIn("A:summary_reads_disagree", r["fail"])
+
+    def test_box_arithmetic_settles_line_1(self):
+        # robot 11: line 1 read four ways, but the total (17,035.00) and line 2 (105.00) agree: line 1 = 16,930.00
+        b = BOX_A.replace("16,930.00", "18,930.00")
+        p = self.pages(BOX_A.replace("16,930.00", "16,830.00"), b=b)
+        p.t["C"] = dict(p.t["A"]); p.t["C"][2] = BOX_A.replace("16,930.00", "16,980.00")
+        p.t["D"] = {2: BOX_A.replace("16,930.00", "16,990.00")}
+        r = R.review_filing(filing(), [row(1, "460A", 1693000)], p, deadline=9e18)
+        self.assertEqual((r["fail"], r["checks"]["A"]["itemized"], r["checks"]["A"]["settled_by"]), ([], 1693000, "arith_total"))
+
+    def test_box_arithmetic_blank_line_1(self):
+        # line 1 read blank (0) by two reads although the schedule has rows: the agreed total minus line 2 settles it
+        blank = BOX_A.replace("$ 16,930.00", "")
+        p = self.pages(blank)
+        p.t["C"] = {2: BOX_A}
+        r = R.review_filing(filing(), [row(1, "460A", 1693000)], p, deadline=9e18)
+        self.assertEqual((r["fail"], r["checks"]["A"]["itemized"]), ([], 1693000))
+        self.assertEqual(R.arith_l1({"A": [0, 0, 0], "B": [0, 0, 0]}), None)             # blank reads are no evidence
+        self.assertEqual(R.arith_l1({"A": [0, 500, 1500], "B": [0, 400, 1500]}), None)   # line 2 not agreed
+        self.assertEqual(R.arith_l1({"A": [0, 0, 0, 9000], "B": [7, 0, 0, 9000], "C": [0, 0, 0, 0]}), 9000)
 
     def test_read_d_settles_three_way_disagreement(self):
         b = BOX_A.replace("16,930.00", "18,930.00").replace("17,035.00", "19,035.00")
@@ -381,6 +401,28 @@ class TestDuplicates(unittest.TestCase):
         self.assertEqual((res["cf_2"]["verdict"], res["cf_2"]["fail"][0]), ("FLAG", "amendment_order_unknown"))
 
 
+    def test_cover_fppc_ids(self):
+        # robot 10: name variants with one FPPC ID are one committee; different IDs sharing donors are two committees
+        mk = lambda fid, **kw: filing(fid, source_hash=fid * 8, raw_json="{}", **kw)
+        fs = {"cf_1": mk("cf_1", filer_identity_id="csi_a", filer_name_raw="Committee to Elect Pat", filing_date="2016-03-30"),
+              "cf_2": mk("cf_2", filer_identity_id="csi_b", filer_name_raw="Elect Pat to Council", filing_date="2016-07-19", amendment_number=1)}
+        rows = self.rows("cf_1", 8) + self.rows("cf_2", 7) + self.rows("cf_2", 1, base=60)
+        d = self.run_dups(fs, rows)
+        self.assertEqual({k: v[0] for k, v in d.items()}, {"cf_1": "possible_duplicate_other_filer", "cf_2": "possible_duplicate_other_filer"})
+        by = defaultdict(list)
+        for r in rows:
+            by[r["filing_id"]].append(r)
+        d = R.dup_groups(fs, by, {}, cover={"cf_1": {"1378609"}, "cf_2": {"1378609"}})
+        self.assertEqual(d, {"cf_1": ("superseded_by_amendment", "cf_2")})
+        d = R.dup_groups(fs, by, {}, cover={"cf_1": {"1461127"}, "cf_2": {"1461081"}})
+        self.assertEqual(d, {})
+        d = R.dup_groups(fs, by, {}, cover={"cf_1": {"1461127"}})          # one cover unread: still a possible copy
+        self.assertEqual({k: v[0] for k, v in d.items()}, {"cf_1": "possible_duplicate_other_filer", "cf_2": "possible_duplicate_other_filer"})
+
+    def test_fppc_id_pattern(self):
+        t = "3. Committee Information  I.D. NUMBER 1382120  phone (310) 555-1212  zip 90232  $1,234,567.00  02/28/2016"
+        self.assertEqual(R.FPPC_ID.findall(t), ["1382120"])
+
     def test_scan_copies_count_once(self):
         # robot 9: same page span, near-identical covers, boxes never contradict (None = a box one scan could not read)
         pend = {"cf_1": ["cf_1", "cf_2"], "cf_2": ["cf_1", "cf_2"]}
@@ -412,9 +454,21 @@ class TestDuplicates(unittest.TestCase):
         fp = {f: R.rows_fp(R.live_rows(rows_by[f])) for f in fs}
         v2 = json.dumps({"robot_v": 2})
         prior = {"cf_1": {"verdict": "FLAG", "applied": 0, "rows_fp": fp["cf_1"], "reason": "amendment_order_unknown;A:x", "checks": v2},
-                 "cf_2": {"verdict": "FLAG", "applied": 0, "rows_fp": fp["cf_2"], "reason": "A:rows_do_not_reconcile", "checks": v2}}
+                 "cf_2": {"verdict": "FLAG", "applied": 0, "rows_fp": fp["cf_2"], "reason": "A:no_summary_box", "checks": v2}}
         pend = {"cf_1": ["cf_1", "cf_9"]}
         todo, reapply, unflip = R.plan_work(fs, rows_by, {}, pend, prior)
+        self.assertEqual(todo, ["cf_1"])
+        # robot 11: a flag whose stored reads give line 1 by arithmetic is reviewed once more
+        prior["cf_2"]["checks"] = json.dumps({"robot_v": 2, "E": {"rows_sum": 500, "itemized": 0, "reads": [
+            {"page": 3, "A": [0, 0, 0, 900], "B": [0, 0, 0, 900]}]}})
+        todo, reapply, unflip = R.plan_work(fs, rows_by, {}, pend, prior)
+        self.assertEqual(todo, ["cf_1", "cf_2"])
+        prior["cf_2"]["checks"] = v2
+        prior["cf_2"]["reason"] = "possible_duplicate_other_filer"
+        todo, reapply, unflip = R.plan_work(fs, rows_by, {"cf_2": ("superseded_by_amendment", "cf_3")}, pend, prior)
+        self.assertEqual(todo, ["cf_1", "cf_2"])                           # dup reason changed: re-recorded
+        prior["cf_2"]["reason"] = "superseded_by_amendment"
+        todo, reapply, unflip = R.plan_work(fs, rows_by, {"cf_2": ("superseded_by_amendment", "cf_3")}, pend, prior)
         self.assertEqual(todo, ["cf_1"])
 
     def test_two_scans_few_undated_rows_are_one_statement(self):
