@@ -562,7 +562,39 @@ def near_period(pa, pb, days=3):
     return max(d) <= days
 
 
-def dup_groups(filings, rows_by, efile_keys, pending=None):
+def eff_period(f):
+    """The statement's period for the overlap test. A period cannot end after the statement was filed: an end date
+    later than the filing date is an OCR misread, so the filing date stands in for it (robot 5)."""
+    ps, pe, fd = f["period_start"], f["period_end"], f.get("filing_date")
+    if ps and pe and fd and pe > fd >= ps:
+        pe = fd
+    return (ps, pe)
+
+
+def restated(fa, fb, amt_a, amt_b, rows_a, rows_b, days=10):
+    """Robot 6: two statements of one committee that start the same day, were filed on different days and share at
+    least 80% of the smaller one's rows are one period filed twice (an amendment); the end date of one was misread.
+    The ends must sit within `days` of each other, or the earlier-filed one's own rows run past its stated end."""
+    if not (fa["period_start"] and fa["period_start"] == fb["period_start"] and fa["period_end"] and fb["period_end"]):
+        return False
+    if not (fa.get("filing_date") and fb.get("filing_date") and fa["filing_date"] != fb["filing_date"]):
+        return False
+    small = min(sum(amt_a.values()), sum(amt_b.values()))
+    if small < 5 or sum((amt_a & amt_b).values()) / small < 0.8:
+        return False
+    try:
+        gap = abs((datetime.date.fromisoformat(fa["period_end"]) - datetime.date.fromisoformat(fb["period_end"])).days)
+    except ValueError:
+        return False
+    if gap <= days:
+        return True
+    early, rows = (fa, rows_a) if fa["filing_date"] < fb["filing_date"] else (fb, rows_b)
+    later = fb if early is fa else fa
+    last = max((r["transaction_date"] for r in rows if r["transaction_date"]), default=None)
+    return bool(last and early["period_end"] < last <= later["period_end"])
+
+
+def dup_groups(filings, rows_by, efile_keys, pending=None, disjoint=None):
     """{filing_id: (reason, other)} for OCR filings that are duplicates or superseded.
 
     FPPC rules, applied per committee (same filer, or same rows):
@@ -572,7 +604,15 @@ def dup_groups(filings, rows_by, efile_keys, pending=None):
         (resolve_copies: identical summary boxes = one statement), else flagged amendment_order_unknown;
       * different periods where one fully contains the other and every amount of the contained one is in the container:
         the contained statement is superseded (counting both would double count);
+      * robot 6 (restated): same start, filed on different days, >= 80% shared rows = one period filed twice; the
+        later filing supersedes;
+      * robot 7: a contained statement filed BEFORE its container, with >= 5 rows and >= 90% of them in the
+        container, is superseded too (the container restates it; the few missing rows are OCR misreads);
+      * robot 8: overlapping statements that share no row amount at all are separate statements whose period was
+        misread - neither is a duplicate. The pair is returned in `disjoint`; check_disjoint() flags it again after
+        review when both pass with identical summary boxes (that would be one statement read twice);
       * any other overlap of one committee's periods stays flagged (overlapping_periods).
+    Periods ending after the filing date are read with the filing date as their end (robot 5, eff_period).
     """
     out = {}
     sig, amt = {}, {}
@@ -590,6 +630,8 @@ def dup_groups(filings, rows_by, efile_keys, pending=None):
 
     def per(f):
         return (f["period_start"], f["period_end"])
+
+    rows_amt = {fid: [r for r in live_rows(rows_by.get(fid, [])) if r["amount_minor"] is not None] for fid in filings}
 
     def pages_key(f):
         try:
@@ -656,7 +698,8 @@ def dup_groups(filings, rows_by, efile_keys, pending=None):
             clusters = []
             for m in sorted(ms):
                 for c in clusters:
-                    if near_period(per(filings[m]), per(filings[c[0]])) or (sig[m] and sig[m] == sig[c[0]]):
+                    if near_period(per(filings[m]), per(filings[c[0]])) or (sig[m] and sig[m] == sig[c[0]]) or \
+                            restated(filings[m], filings[c[0]], amt[m], amt[c[0]], rows_amt[m], rows_amt[c[0]]):
                         c.append(m)
                         break
                 else:
@@ -694,17 +737,29 @@ def dup_groups(filings, rows_by, efile_keys, pending=None):
             # 2. statements of different periods that overlap
             for i, (ha, ga) in enumerate(heads):
                 for hb, gb in heads[i + 1:]:
-                    pa, pb = per(filings[ha]), per(filings[hb])
+                    pa, pb = eff_period(filings[ha]), eff_period(filings[hb])
                     if not (all(pa) and all(pb) and pa[0] <= pb[1] and pb[0] <= pa[1]):
                         continue
                     done = False
                     for outer, inner, go, gi in ((ha, hb, ga, gb), (hb, ha, gb, ga)):
-                        po, pi = per(filings[outer]), per(filings[inner])
+                        po, pi = eff_period(filings[outer]), eff_period(filings[inner])
                         if po[0] <= pi[0] and pi[1] <= po[1] and po != pi and len(go) == 1 and len(gi) == 1:
                             if amt[inner] and not (amt[inner] - amt[outer]):
                                 out[inner] = ("superseded_by_containing_period", outer)
                                 done = True
                                 break
+                            fo, fi = filings[outer], filings[inner]
+                            n_in = sum(amt[inner].values())
+                            if n_in >= 5 and fo.get("filing_date") and fi.get("filing_date") and fi["filing_date"] < fo["filing_date"] \
+                                    and sum((amt[inner] & amt[outer]).values()) / n_in >= 0.9:
+                                out[inner] = ("superseded_by_containing_period", outer)
+                                done = True
+                                break
+                    if not done and all(amt[m] for m in ga + gb) and \
+                            not any(amt[x] & amt[y] for x in ga for y in gb):
+                        if disjoint is not None:
+                            disjoint.append((ha, hb))
+                        done = True
                     if not done:
                         for g, other in ((ga, hb), (gb, ha)):
                             for m in g:
@@ -838,6 +893,24 @@ def resolve_copies(pending, results, prior):
                                             "summaries": {k: list(v) for k, v in trip.items()}}
 
 
+def check_disjoint(disjoint, results, prior, dups):
+    """Robot 8's guard: two overlapping statements that share no row amounts both count only when they are not one
+    statement read twice - if both pass with identical summary boxes (A, C, E line 1) both are flagged again.
+    A statement whose partner is still flagged as a duplicate itself is unaffected (it never counts)."""
+    for a, b in disjoint:
+        if a in dups or b in dups:
+            continue
+        ta, tb = summary_triple(a, results, prior), summary_triple(b, results, prior)
+        if None in ta or ta != tb:
+            continue
+        for m, o in ((a, b), (b, a)):
+            if m not in results:
+                continue
+            r = results[m]
+            r.update(verdict="FLAG", corrections=[], drop=[], fail=["overlapping_periods"] + [x for x in r["fail"] if x != "overlapping_periods"])
+            r["checks"]["duplicate"] = {"reason": "overlapping_periods", "other": o, "why": "disjoint rows but identical summary boxes"}
+
+
 # ----------------------------------------------------------------------------- main
 def load(d1, places):
     jids = ",".join(F_lit(f"jurisdiction-{p}") for p in places)
@@ -934,8 +1007,8 @@ def main():
     for r in ef:
         if r["provenance"] != "ocr":
             efile_keys[r["jurisdiction_id"]].add((r["schedule_code"], r["amount_minor"], r["transaction_date"]))
-    pending = {}
-    dups = dup_groups(filings, rows_by, efile_keys, pending=pending)
+    pending, disjoint = {}, []
+    dups = dup_groups(filings, rows_by, efile_keys, pending=pending, disjoint=disjoint)
 
     todo, reapply, unflip = plan_work(filings, rows_by, dups, pending, prior)
 
@@ -964,6 +1037,7 @@ def main():
         r["verdict"] = "FLAG" if r["fail"] else ("CORRECTED_PASS" if (r["corrections"] or r["drop"]) else "PASS")
         results[fid] = r
     resolve_copies(pending, results, prior)
+    check_disjoint(disjoint, results, prior, dups)
     for fid in unflip:
         results[fid] = {"filing_id": fid, "jurisdiction_id": filings[fid]["jurisdiction_id"], "verdict": "FLAG", "corrections": [],
                         "drop": [], "fail": [dups[fid][0]], "gap": {}, "unflip": True,

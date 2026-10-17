@@ -78,7 +78,14 @@ Scanned Form 460s are OCR'd into staging D1 `campaign_transactions` as `record_s
   amendment, then the latest filing date wins; a tie with identical rows is a copy; a tie with different rows is
   reviewed and counts once only when every copy's A / C / E summary boxes are identical (`same_statement_copy`), else
   `amendment_order_unknown`; a period fully inside another whose amounts are all in the container is
-  `superseded_by_containing_period`; same document + same pages = one statement. Anything else stays flagged.
+  `superseded_by_containing_period`; same document + same pages = one statement.
+- *Phase 3 period robots*: a period that ends after its own filing date is read as ending on the filing date
+  (OCR misread); two statements of one committee that start the same day, were filed on different days and share
+  >= 80% of rows are one period filed twice (ends within 10 days, or the earlier one's rows run past its stated end):
+  the later filing supersedes; a contained statement filed before its container with >= 5 rows and >= 90% of them in
+  the container is `superseded_by_containing_period`; overlapping statements that share no row amount at all are
+  separate statements with a misread period (each must still reconcile on its own, and both are flagged again if they
+  pass with identical summary boxes). Anything else stays flagged.
 
 PASS / CORRECTED_PASS rows go `OCR_UNREVIEWED -> ACTIVE` (provenance stays `ocr`); every flip is in
 `clerk_review_flips` (per run). Verdicts are in `clerk_reviews`. A Time Travel bookmark is taken before any write.
