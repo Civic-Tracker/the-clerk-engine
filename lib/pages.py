@@ -16,6 +16,9 @@ import gzip, json, os, re, subprocess, tempfile, threading
 
 STAGING_BUCKET = "civic-tracker-bakeoff-evidence"
 
+# one tesseract thread per call: reads already run in parallel, and OpenMP threads oversubscribe small runners
+ENV = dict(os.environ, OMP_THREAD_LIMIT="1")
+
 READS = {"B": ("300", "4"), "C": ("400", "6"), "D": ("400", "4")}
 THRESH = {"D": "55%"}
 T_DPI = 400
@@ -201,14 +204,26 @@ class Pages:
                     base = os.path.join(td, "pg")
                     subprocess.run(["pdftoppm", "-r", str(T_DPI), "-gray", "-f", str(page), "-l", str(page), "-png", "-singlefile", pdf, base],
                                    capture_output=True, timeout=300)
+                    try:
+                        from PIL import Image          # optional: one decode of the page for all its cells
+                        img = Image.open(base + ".png")
+                        img.load()
+                    except Exception:
+                        img = None
                     for k, b in todo:
                         x0, y0, x1, y1 = (max(0, int(v)) for v in b)
                         cp_png = os.path.join(td, "c.png")
-                        subprocess.run(["convert", base + ".png", "-crop", f"{x1 - x0}x{y1 - y0}+{x0}+{y0}", "+repage",
-                                        "-bordercolor", "white", "-border", "20", cp_png], capture_output=True, timeout=60)
+                        if img is not None:
+                            c = img.crop((x0, y0, x1, y1))
+                            pad = Image.new(c.mode, (c.width + 40, c.height + 40), 255)
+                            pad.paste(c, (20, 20))
+                            pad.save(cp_png)
+                        else:
+                            subprocess.run(["convert", base + ".png", "-crop", f"{x1 - x0}x{y1 - y0}+{x0}+{y0}", "+repage",
+                                            "-bordercolor", "white", "-border", "20", cp_png], capture_output=True, timeout=60)
                         self.stats["ocr_cells"] = self.stats.get("ocr_cells", 0) + 1
                         r = subprocess.run(["tesseract", cp_png, "-", "--psm", "7", "-c", "tessedit_char_whitelist=0123456789.,$"],
-                                           capture_output=True, text=True, timeout=60)
+                                           capture_output=True, text=True, timeout=60, env=ENV)
                         have_[k] = r.stdout.strip()
                 os.makedirs(os.path.dirname(cp), exist_ok=True)
                 with open(cp + f".{os.getpid()}.{threading.get_ident()}.tmp", "w", encoding="utf-8") as f:
@@ -239,7 +254,7 @@ class Pages:
                            capture_output=True, timeout=300)
             if not os.path.exists(base + ".png"):
                 return []
-            r = subprocess.run(["tesseract", base + ".png", "-", "--psm", "6", "tsv"], capture_output=True, text=True, timeout=300)
+            r = subprocess.run(["tesseract", base + ".png", "-", "--psm", "6", "tsv"], capture_output=True, text=True, timeout=300, env=ENV)
         ws = []
         for row in csv.DictReader(io.StringIO(r.stdout), delimiter="\t", quoting=csv.QUOTE_NONE):
             if row.get("level") == "5" and (row.get("text") or "").strip():
@@ -265,5 +280,5 @@ class Pages:
                 return ""
             if threshold:
                 subprocess.run(["convert", base + ".png", "-threshold", threshold, base + ".png"], capture_output=True, timeout=120)
-            r = subprocess.run(["tesseract", base + ".png", "-", "--psm", psm], capture_output=True, text=True, timeout=300)
+            r = subprocess.run(["tesseract", base + ".png", "-", "--psm", psm], capture_output=True, text=True, timeout=300, env=ENV)
             return r.stdout

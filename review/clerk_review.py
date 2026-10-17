@@ -460,8 +460,9 @@ def pick_box_pages(texts, s):
     return filled[:3] if filled else pages_[:1]
 
 
-def prefetch(todo, filings, pages, deadline, workers=None):
-    """Run read B for every summary-box page of the filings to review, in parallel, until the deadline."""
+def prefetch(todo, filings, pages, deadline, workers=None, robots_for=None):
+    """Run read B for every summary-box page of the filings to review (and read T for the schedule pages of
+    filings flagged before, {fid: rows}), in parallel, until the deadline."""
     from concurrent.futures import ThreadPoolExecutor
     jobs = []
     for fid in todo:
@@ -476,14 +477,27 @@ def prefetch(todo, filings, pages, deadline, workers=None):
         for s in "ACE":
             for p in pick_box_pages(texts, s):
                 if not pages.cached("B", sha, p):
-                    jobs.append((slug, sha, key, p))
+                    jobs.append(("B", slug, sha, key, p))
+        if robots_for and fid in robots_for and hasattr(pages, "words"):
+            # a filing flagged before: its schedule pages get the 400 dpi word-box read the robots need
+            rp = {row_page(r) for r in robots_for[fid]}
+            head = re.compile(r"sch\w{0,6}\s*[-_.]?\s*[ACE]\b", re.I)
+            for p, t in texts.items():
+                if (p in rp or head.search("\n".join(t.split("\n")[:15]))) and not pages.cached_words(sha, p):
+                    jobs.append(("T", slug, sha, key, p))
 
     jobs = sorted(set(jobs))
 
     def one(j):
         if time.time() > deadline:
             return
-        pages.read("B", *j, box=True)
+        try:
+            if j[0] == "T":
+                pages.words(*j[1:])
+            else:
+                pages.read("B", *j[1:], box=True)
+        except Exception as e:                # a bad page never stops the prefetch; the review re-reads it
+            log(f"prefetch {j[0]} {j[2][:8]} p{j[4]}: {type(e).__name__}")
     with ThreadPoolExecutor(max_workers=workers or max(1, os.cpu_count() or 1)) as ex:
         list(ex.map(one, jobs))
 
@@ -900,7 +914,8 @@ def main():
             todo.append(fid)
 
     log(f'loaded {len(filings)} filings; todo {len(todo)} reapply {len(reapply)}')
-    prefetch([f for f in todo if f not in dups], filings, pages, deadline)
+    reflag = {f: live_rows(rows_by[f]) for f in todo if f not in dups and prior.get(f) and prior[f]["verdict"] == "FLAG"}
+    prefetch([f for f in todo if f not in dups], filings, pages, deadline, robots_for=reflag)
     log(f'prefetch done ocr={pages.stats}')
     results, deferred = {}, []
     for fid in todo:
@@ -1008,8 +1023,11 @@ def main():
         gaps = {s: g for s, g in r["gap"].items()}
         flags.append({"filing_id": fid, "place": slug_of(r["jurisdiction_id"]), "reason": ";".join(r["fail"]),
                       "gap_minor": gaps, "auto_excluded": reason.startswith(("duplicate_copy", "superseded", "duplicate_of_efile", "same_statement_copy"))})
-    corrections = [{"filing_id": fid, **c} for fid, r in results.items() if r["verdict"] == "CORRECTED_PASS"
-                   for c in r["corrections"] + r["drop"]]
+    # the public report carries ids, rules and amounts only: names, dates and rebuilt-row details stay in D1
+    corrections = [{"filing_id": fid, "transaction_id": c["transaction_id"], "rule": c["rule"], "field": c["field"], "page": c.get("page"),
+                    **({"before": c["before"], "after": c["after"]} if c["field"] in ("amount_minor", "record_state") else {}),
+                    **({"after_amount_minor": json.loads(c["after"])["amount_minor"]} if c["field"] == "inserted" else {})}
+                   for fid, r in results.items() if r["verdict"] == "CORRECTED_PASS" for c in r["corrections"] + r["drop"]]
 
     passed = [{"filing_id": fid, "place": slug_of(r["jurisdiction_id"]), "verdict": r["verdict"], "reapply": bool(r.get("reapply")),
                "rows_flipped": len(flips.get(fid, [])),
