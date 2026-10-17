@@ -18,7 +18,7 @@ Every fix is logged before/after (CORRECTED_PASS). Unresolved flags stay OCR_UNR
 
 PASS / CORRECTED_PASS rows go OCR_UNREVIEWED -> ACTIVE (provenance stays 'ocr'), logged per run so a run can be
 reverted (--revert RUN_ID). A place's batch is HELD (nothing written for it) on a major discrepancy:
-  * a counted Raised/Spent total for a (place, year) that already has counted money moves > 10% or > $250k,
+  * a counted Raised/Spent total for a (place, year) that already has counted money moves > $250k,
   * a filing > 10x its committee's history (>= 2 other filings) and > $50k,
   * a passing filing whose rows overlap ACTIVE e-filed rows (double counting),
   * any row outside Schedules A/C/E or any Form 496 row in the batch.
@@ -38,7 +38,7 @@ import form460 as F  # noqa: E402
 
 TOL = 50                      # $0.50 in cents
 ROBOT_V = 2                   # phase 2 robots: a FLAG from an older version is re-read once
-MOVE_PCT, MOVE_ABS = 0.10, 25_000_000   # 10% / $250,000 in cents
+MOVE_ABS = 25_000_000   # $250,000 in cents (Bryan dropped the 10% rule, Oct 16 2026)
 OOM_MIN = 5_000_000           # $50,000
 SCHED = {"460A": "A", "460C": "C", "460E": "E"}
 DUP_REASONS = {"duplicate_copy", "superseded_by_amendment", "superseded_by_containing_period", "same_statement_copy", "amendment_order_unknown", "overlapping_periods",
@@ -1046,7 +1046,7 @@ def main():
             continue
         b = base.get((jid, yr, sc), 0)
         moves.append({"place": slug_of(jid), "year": yr, "schedule": sc, "counted_before_minor": b, "added_minor": amt})
-        if b > 0 and (amt > MOVE_PCT * b or amt > MOVE_ABS):
+        if b > 0 and amt > MOVE_ABS:
             place[slug_of(jid)]["hold_reasons"].append(f"{sc} {yr} counted total moves {amt} on base {b}")
     # the known Culver City 2022 Form 496 possible double count must not be touched
     f496_2022 = [fid for fid in flips if filings[fid].get("form_number") == "496" and filings[fid].get("cycle_year") == 2022]
