@@ -37,7 +37,10 @@ sys.path.insert(0, os.path.join(HERE, "..", "lib"))
 import form460 as F  # noqa: E402
 
 TOL = 50                      # $0.50 in cents
-ROBOT_V = 2                   # phase 2 robots: a FLAG from an older version is re-read once
+ROBOT_V = 3                   # robots version: a FLAG from an older version is re-read once (see robot_need)
+# the robots version a standing FLAG needs before it is left alone: phase 3 (v3) only changed the copy check, so only
+# amendment_order_unknown flags are re-read for it; every other flag stands from v2 on
+ROBOT_NEED = {"amendment_order_unknown": 3}
 MOVE_ABS = 25_000_000   # $250,000 in cents (Bryan dropped the 10% rule, Oct 16 2026)
 OOM_MIN = 5_000_000           # $50,000
 SCHED = {"460A": "A", "460C": "C", "460E": "E"}
@@ -859,10 +862,51 @@ def verdict_of(fid, results, prior):
     return r["verdict"] if r else (prior.get(fid) or {}).get("verdict")
 
 
-def resolve_copies(pending, results, prior):
+COVER_SIM = 0.8
+
+
+def scan_copies(pending, filings, pages):
+    """Robot 9 input: for each tie group in `pending`, whether its members look like scans of one document - the same
+    page span (#pages=a-b, or the same page count) and cover pages (read A) at least COVER_SIM alike (difflib ratio).
+    {tuple(members): min cover similarity} for the groups with the same span."""
+    import difflib
+    out = {}
+    for ms in {tuple(v) for v in pending.values()}:
+        spans, covers = set(), []
+        for m in ms:
+            f = filings[m]
+            slug, sha, key = slug_of(f["jurisdiction_id"]), f["source_hash"], f["evidence_r2_key"]
+            if not sha:
+                break
+            try:
+                p0, p1 = page_range(f, lambda: pages.pages_of(slug, sha, key))
+                covers.append(pages.read_a(slug, sha, key, p0) or "" if p0 else "")
+            except Exception:
+                break
+            spans.add((p0, p1))
+        else:
+            if len(spans) == 1 and all(len(c) >= 400 for c in covers):
+                out[ms] = min(difflib.SequenceMatcher(None, a, b).ratio() for i, a in enumerate(covers) for b in covers[i + 1:])
+    return out
+
+
+def compatible(trips):
+    """Summary boxes that never contradict: per schedule every agreed figure is the same (None = not read)."""
+    for i in range(3):
+        vals = {t[i] for t in trips if t[i] is not None}
+        if len(vals) > 1:
+            return False
+    return True
+
+
+def resolve_copies(pending, results, prior, covers=None):
     """Robot 4, copy check: statements of one committee and period that tie on amendment number and filing date.
     When every member's summary boxes (A, C, E line 1, each agreed by two reads) are identical they are copies of one
-    statement: one counts (the lowest id that passes) and the rest are same_statement_copy. Anything else stays
+    statement: one counts (the lowest id that passes) and the rest are same_statement_copy.
+    Robot 9 (scan copies): when the members cover the same page span with cover pages at least COVER_SIM alike
+    (`covers`, from scan_copies) and their summary boxes never contradict (a box one scan could not read is no
+    contradiction), they are two scans of one statement too: the passing one counts (else the one with the most agreed
+    boxes stays flagged for its own reasons) and the rest are same_statement_copy. Anything else stays
     amendment_order_unknown for a clerk."""
     seen = set()
     for fid, ms in sorted(pending.items()):
@@ -872,15 +916,25 @@ def resolve_copies(pending, results, prior):
         seen.add(key)
         trip = {m: summary_triple(m, results, prior) for m in ms}
         same = all(None not in t for t in trip.values()) and len(set(trip.values())) == 1
-        if same:
+        scan = not same and covers is not None and covers.get(key, 0) >= COVER_SIM and compatible(list(trip.values()))
+        if same or scan:
             passing = [m for m in ms if verdict_of(m, results, prior) in ("PASS", "CORRECTED_PASS")]
-            keep = min(passing) if passing else min(ms)
+            if scan:
+                keep = min(passing) if len(passing) == 1 else (None if passing else
+                                                              min(ms, key=lambda m: (-sum(v is not None for v in trip[m]), m)))
+                if keep is None:          # two scans both pass on their own: same boxes is the test, and they differ
+                    scan = False
+            else:
+                keep = min(passing) if passing else min(ms)
+        if same or scan:
             for m in ms:
                 if m == keep or m not in results:
                     continue
                 r = results[m]
                 r.update(verdict="FLAG", corrections=[], drop=[], fail=["same_statement_copy"] + [x for x in r["fail"] if x != "same_statement_copy"])
                 r["checks"]["duplicate"] = {"reason": "same_statement_copy", "other": keep}
+                if scan:
+                    r["checks"]["duplicate"]["why"] = f"scan copy: same pages, cover {covers[key]:.2f} alike, boxes agree where read"
             if keep in results:
                 results[keep]["checks"]["copies"] = [m for m in ms if m != keep]
         else:
@@ -967,7 +1021,8 @@ def plan_work(filings, rows_by, dups, pending, prior):
                 pv = json.loads(p["checks"] or "{}").get("robot_v", 1)
             except ValueError:
                 pv = 1
-            if was_dup == (fid in dups or fid in pending) and pv >= ROBOT_V:
+            need = ROBOT_NEED.get((p["reason"] or "").split(";")[0], 2)
+            if was_dup == (fid in dups or fid in pending) and pv >= need:
                 continue                     # same rows, same duplicate status, same robots: the flag stands
             todo.append(fid)
         else:
@@ -1036,7 +1091,7 @@ def main():
             r["checks"]["duplicate"] = {"reason": dups[fid][0], "other": dups[fid][1]}
         r["verdict"] = "FLAG" if r["fail"] else ("CORRECTED_PASS" if (r["corrections"] or r["drop"]) else "PASS")
         results[fid] = r
-    resolve_copies(pending, results, prior)
+    resolve_copies(pending, results, prior, covers=scan_copies(pending, filings, pages))
     check_disjoint(disjoint, results, prior, dups)
     for fid in unflip:
         results[fid] = {"filing_id": fid, "jurisdiction_id": filings[fid]["jurisdiction_id"], "verdict": "FLAG", "corrections": [],

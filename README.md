@@ -85,7 +85,12 @@ Scanned Form 460s are OCR'd into staging D1 `campaign_transactions` as `record_s
   the later filing supersedes; a contained statement filed before its container with >= 5 rows and >= 90% of them in
   the container is `superseded_by_containing_period`; overlapping statements that share no row amount at all are
   separate statements with a misread period (each must still reconcile on its own, and both are flagged again if they
-  pass with identical summary boxes). Anything else stays flagged.
+  pass with identical summary boxes).
+- *Scan copies* (robot 9, `ROBOT_V = 3`; only `amendment_order_unknown` flags are re-read for it): a tie whose members
+  cover the same page span with cover pages >= 0.8 alike (difflib on read A) and summary boxes that never contradict
+  (a box one scan could not read is no contradiction) is two scans of one statement: the passing one counts, else the
+  one with the most agreed boxes stays flagged for its own reasons; the rest are `same_statement_copy`. If both pass
+  without identical boxes, or any box contradicts, it stays `amendment_order_unknown`. Anything else stays flagged.
 
 PASS / CORRECTED_PASS rows go `OCR_UNREVIEWED -> ACTIVE` (provenance stays `ocr`); every flip is in
 `clerk_review_flips` (per run). Verdicts are in `clerk_reviews`. A Time Travel bookmark is taken before any write.
