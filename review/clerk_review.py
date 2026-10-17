@@ -580,6 +580,9 @@ def dup_groups(filings, rows_by, efile_keys, pending=None):
         lr = [r for r in live_rows(rows_by.get(fid, [])) if r["amount_minor"] is not None]
         sig[fid] = Counter((r["schedule_code"], r["amount_minor"], r["transaction_date"]) for r in lr if r["transaction_date"])
         amt[fid] = Counter((r["schedule_code"], r["amount_minor"]) for r in lr)
+    # every row, dated or not (Schedule E rows often carry no date): the copy test compares these
+    full = {fid: Counter((r["schedule_code"], r["amount_minor"], r["transaction_date"]) for r in live_rows(rows_by.get(fid, []))
+                         if r["amount_minor"] is not None) for fid in filings}
     by_j = defaultdict(list)
     for fid, f in filings.items():
         if live_rows(rows_by.get(fid, [])):   # filings whose rows the ingest already superseded are out
@@ -624,6 +627,14 @@ def dup_groups(filings, rows_by, efile_keys, pending=None):
                 small = min(sum(sa.values()), sum(sb.values()))
                 ov = sum((sa & sb).values()) / small if small else 0.0
                 identical = small >= 3 and sa == sb
+                # two scans of one statement: related filer names, same period, same filed date, the same rows
+                # (any count >= 1, dated or not)
+                na, nb = name_key(fa["filer_name_raw"]), name_key(fb["filer_name_raw"])
+                related = bool(fa["filer_identity_id"] and fa["filer_identity_id"] == fb["filer_identity_id"]) or \
+                    bool(na and nb and (na in nb or nb in na))
+                if related and all(pa) and pa == pb and fa["filing_date"] and fa["filing_date"] == fb["filing_date"] \
+                        and full[a] and full[a] == full[b]:
+                    identical = True
                 same_doc = pages_key(fa) is not None and pages_key(fa) == pages_key(fb)
                 if same_filer and (overlap_period or (small >= 5 and ov >= 0.5)):
                     union(a, b)
@@ -665,7 +676,7 @@ def dup_groups(filings, rows_by, efile_keys, pending=None):
                     if m not in ties:
                         out[m] = ("superseded_by_amendment", best)
                 if len(ties) > 1:
-                    if all(sig[m] == sig[ties[0]] for m in ties) and sig[ties[0]]:
+                    if all(full[m] == full[ties[0]] and sig[m] == sig[ties[0]] for m in ties) and full[ties[0]]:
                         keep = min(ties)      # re-released copy of the same statement: keep one, deterministic
                         for m in ties:
                             if m != keep:
@@ -893,9 +904,14 @@ def main():
     pending = {}
     dups = dup_groups(filings, rows_by, efile_keys, pending=pending)
 
-    todo, reapply = [], []
+    todo, reapply, unflip = [], [], []
     for fid, f in sorted(filings.items()):
         lr = live_rows(rows_by[fid])
+        p = prior.get(fid)
+        if fid in dups and p and p["verdict"] in ("PASS", "CORRECTED_PASS") and p["applied"] and \
+                any(r["record_state"] == "ACTIVE" for r in lr):
+            unflip.append(fid)               # counted before, now a duplicate / superseded copy: stop counting it
+            continue
         if not any(r["record_state"] == "OCR_UNREVIEWED" for r in lr):
             continue
         p = prior.get(fid)
@@ -938,6 +954,10 @@ def main():
         r["verdict"] = "FLAG" if r["fail"] else ("CORRECTED_PASS" if (r["corrections"] or r["drop"]) else "PASS")
         results[fid] = r
     resolve_copies(pending, results, prior)
+    for fid in unflip:
+        results[fid] = {"filing_id": fid, "jurisdiction_id": filings[fid]["jurisdiction_id"], "verdict": "FLAG", "corrections": [],
+                        "drop": [], "fail": [dups[fid][0]], "gap": {}, "unflip": True,
+                        "checks": {"duplicate": {"reason": dups[fid][0], "other": dups[fid][1]}, "was": prior[fid]["verdict"]}}
     for fid in reapply:
         p = prior[fid]
         results[fid] = {"filing_id": fid, "jurisdiction_id": filings[fid]["jurisdiction_id"], "verdict": p["verdict"],
@@ -955,6 +975,7 @@ def main():
     eff = {fid: effective_rows(rows_by[fid], r, filings[fid]) for fid, r in results.items() if r["verdict"] != "FLAG"}
     place = {p: {"reviewed": 0, "PASS": 0, "CORRECTED_PASS": 0, "FLAG": 0, "deferred": 0, "reapplied": 0,
                  "flip_rows": 0, "raised_minor": 0, "spent_minor": 0, "nonmonetary_minor": 0, "held": False,
+                 "unflip_rows": 0, "un_raised_minor": 0, "un_spent_minor": 0, "un_nonmonetary_minor": 0,
                  "hold_reasons": []} for p in places}
     flips = defaultdict(list)
     added = defaultdict(int)
@@ -969,6 +990,13 @@ def main():
         pl["reviewed"] += 0 if r.get("reapply") else 1
         pl["reapplied"] += 1 if r.get("reapply") else 0
         pl[r["verdict"]] += 1
+        if r.get("unflip"):
+            for t in live_rows(rows_by[fid]):
+                if t["record_state"] == "ACTIVE":
+                    pl["unflip_rows"] += 1
+                    k = {"460A": "raised_minor", "460E": "spent_minor", "460C": "nonmonetary_minor"}.get(t["schedule_code"])
+                    if k:
+                        pl["un_" + k] += t["amount_minor"] or 0
         if r["verdict"] == "FLAG":
             continue
         for t in eff[fid]:
@@ -1059,6 +1087,9 @@ def main():
                     chunk = ",".join(lit(x) for x in ids[i:i + 200])
                     st.append(f"INSERT OR IGNORE INTO clerk_review_flips (run_id, transaction_id, filing_id, from_state, to_state, flipped_at) SELECT {lit(run_id)}, id, filing_id, record_state, 'ACTIVE', {lit(ts)} FROM campaign_transactions WHERE id IN ({chunk}) AND record_state = 'OCR_UNREVIEWED' AND provenance = 'ocr'")
                     st.append(f"UPDATE campaign_transactions SET record_state = 'ACTIVE', updated_at = {lit(ts)} WHERE id IN ({chunk}) AND record_state = 'OCR_UNREVIEWED' AND provenance = 'ocr'")
+            if r.get("unflip"):
+                st.append(f"INSERT OR IGNORE INTO clerk_review_flips (run_id, transaction_id, filing_id, from_state, to_state, flipped_at) SELECT {lit(run_id)}, id, filing_id, 'ACTIVE', 'OCR_UNREVIEWED', {lit(ts)} FROM campaign_transactions WHERE filing_id = {lit(fid)} AND record_state = 'ACTIVE' AND provenance = 'ocr' AND id IN (SELECT transaction_id FROM clerk_review_flips WHERE filing_id = {lit(fid)} AND to_state = 'ACTIVE' AND reverted_at IS NULL)")
+                st.append(f"UPDATE campaign_transactions SET record_state = 'OCR_UNREVIEWED', updated_at = {lit(ts)} WHERE id IN (SELECT transaction_id FROM clerk_review_flips WHERE run_id = {lit(run_id)} AND filing_id = {lit(fid)} AND to_state = 'OCR_UNREVIEWED') AND record_state = 'ACTIVE' AND provenance = 'ocr'")
             fp_rows = [t for t in (eff[fid] if apply else live_rows(rows_by[fid]))]
             checks = json.dumps({k: v for k, v in r["checks"].items()}, separators=(",", ":"))[:20000]
             st.append(f"INSERT OR REPLACE INTO clerk_reviews (filing_id, jurisdiction_id, verdict, reason, checks, rows_fp, applied, run_id, reviewed_at) VALUES ({lit(fid)}, {lit(r['jurisdiction_id'])}, {lit(r['verdict'])}, {lit(';'.join(r['fail']) or None)}, {lit(checks)}, {lit(rows_fp(fp_rows))}, {1 if apply else 0}, {lit(run_id)}, {lit(ts)})")
@@ -1074,7 +1105,8 @@ def revert(db, run_id):
     import d1 as d1mod
     lit, ts = d1mod.lit, now()
     st = [
-        f"UPDATE campaign_transactions SET record_state = 'OCR_UNREVIEWED', updated_at = {lit(ts)} WHERE id IN (SELECT transaction_id FROM clerk_review_flips WHERE run_id = {lit(run_id)} AND reverted_at IS NULL) AND record_state = 'ACTIVE' AND provenance = 'ocr'",
+        f"UPDATE campaign_transactions SET record_state = 'OCR_UNREVIEWED', updated_at = {lit(ts)} WHERE id IN (SELECT transaction_id FROM clerk_review_flips WHERE run_id = {lit(run_id)} AND to_state = 'ACTIVE' AND reverted_at IS NULL) AND record_state = 'ACTIVE' AND provenance = 'ocr'",
+        f"UPDATE campaign_transactions SET record_state = 'ACTIVE', updated_at = {lit(ts)} WHERE id IN (SELECT transaction_id FROM clerk_review_flips WHERE run_id = {lit(run_id)} AND to_state = 'OCR_UNREVIEWED' AND reverted_at IS NULL) AND record_state = 'OCR_UNREVIEWED' AND provenance = 'ocr'",
         f"UPDATE campaign_transactions SET amount_minor = (SELECT CAST(before_value AS INTEGER) FROM clerk_corrections c WHERE c.run_id = {lit(run_id)} AND c.transaction_id = campaign_transactions.id AND c.field = 'amount_minor') WHERE id IN (SELECT transaction_id FROM clerk_corrections WHERE run_id = {lit(run_id)} AND field = 'amount_minor' AND reverted_at IS NULL)",
         f"UPDATE campaign_transactions SET record_state = 'OCR_UNREVIEWED', updated_at = {lit(ts)} WHERE id IN (SELECT transaction_id FROM clerk_corrections WHERE run_id = {lit(run_id)} AND field = 'record_state' AND reverted_at IS NULL) AND record_state IN ('DUPLICATE', 'OCR_REJECTED')",
         *[f"UPDATE campaign_transactions SET {fld} = (SELECT before_value FROM clerk_corrections c WHERE c.run_id = {lit(run_id)} AND c.transaction_id = campaign_transactions.id AND c.field = '{fld}'), updated_at = {lit(ts)} WHERE id IN (SELECT transaction_id FROM clerk_corrections WHERE run_id = {lit(run_id)} AND field = '{fld}' AND reverted_at IS NULL)"
@@ -1101,6 +1133,9 @@ def write_report(report, path):
     for p, v in report["places"].items():
         md.append(f"| {p} | {v['reviewed']} | {v['PASS']} | {v['CORRECTED_PASS']} | {v['FLAG']} | {v['deferred']} | {v['flip_rows'] if not v['held'] else 0} | "
                   f"{v['raised_minor'] / 100:,.2f} | {v['spent_minor'] / 100:,.2f} | {'HELD: ' + '; '.join(v['hold_reasons'][:3]) if v['held'] else 'no'} |")
+    un = {p: v for p, v in report["places"].items() if v.get("unflip_rows")}
+    for p, v in un.items():
+        md.append(f"\n{p}: {v['unflip_rows']} rows of now-duplicate filings back to OCR_UNREVIEWED (Raised -{v['un_raised_minor'] / 100:,.2f}, Spent -{v['un_spent_minor'] / 100:,.2f})")
     if report.get("bookmark_before"):
         md += ["", f"D1 bookmark before writes: `{report['bookmark_before']}`"]
     summ = os.environ.get("GITHUB_STEP_SUMMARY")

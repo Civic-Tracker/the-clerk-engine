@@ -321,6 +321,22 @@ class TestDuplicates(unittest.TestCase):
         self.assertEqual((res["cf_2"]["verdict"], res["cf_2"]["fail"][0]), ("FLAG", "amendment_order_unknown"))
 
 
+    def test_two_scans_few_undated_rows_are_one_statement(self):
+        # Weissman case: 3 undated Schedule E rows, filer read as "Weissman" and "Weissman, Andrew" (two identities)
+        fs = {"cf_1": filing("cf_1", filer_identity_id="csi_a", filer_name_raw="Weissman", filing_date="2014-01-09", source_hash="a" * 64,
+                             period_start="2013-07-01", period_end="2013-12-31"),
+              "cf_2": filing("cf_2", filer_identity_id="csi_b", filer_name_raw="Weissman, Andrew", filing_date="2014-01-09", source_hash="b" * 64,
+                             period_start="2013-07-01", period_end="2013-12-31")}
+        rows = [dict(row(f"{fid}{i}", "460E", amt, date=None), filing_id=fid, record_state="ACTIVE")
+                for fid in ("cf_1", "cf_2") for i, amt in enumerate((17500, 18000, 50000))]
+        self.assertEqual(self.run_dups(fs, rows), {"cf_2": ("duplicate_copy", "cf_1")})
+        fs["cf_2"]["filing_date"] = "2014-02-01"           # filed on another day: not this rule
+        self.assertEqual(self.run_dups(fs, rows), {})
+        fs["cf_2"]["filing_date"] = "2014-01-09"
+        rows[-1] = dict(rows[-1], amount_minor=50100)       # one row differs: not a copy
+        self.assertEqual(self.run_dups(fs, rows), {})
+
+
 class TestMisc(unittest.TestCase):
     def test_page_range(self):
         self.assertEqual(R.page_range(filing(), lambda: 99), (1, 3))
