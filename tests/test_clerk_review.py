@@ -269,8 +269,67 @@ class TestDuplicates(unittest.TestCase):
 
     def test_overlapping_periods_same_committee(self):
         fs = {"cf_1": filing("cf_1"), "cf_2": filing("cf_2", period_start="2018-01-01", period_end="2018-02-24")}
-        d = self.run_dups(fs, self.rows("cf_1", 8) + self.rows("cf_2", 3, base=50))
+        big = self.rows("cf_1", 8)
+        shared = [dict(r, id=r["id"] + "s", filing_id="cf_2") for r in big[:2]]
+        d = self.run_dups(fs, big + shared + self.rows("cf_2", 3, base=50))
         self.assertEqual({k: v[0] for k, v in d.items()}, {"cf_1": "overlapping_periods", "cf_2": "overlapping_periods"})
+
+    def test_overlap_with_no_shared_rows_is_two_statements(self):
+        # robot 8: same committee, overlapping periods, no row amount in common = a misread period, not a duplicate
+        fs = {"cf_1": filing("cf_1"), "cf_2": filing("cf_2", period_start="2018-01-01", period_end="2018-02-24")}
+        by = defaultdict(list)
+        for r in self.rows("cf_1", 8) + self.rows("cf_2", 3, base=50):
+            by[r["filing_id"]].append(r)
+        dis = []
+        d = R.dup_groups(fs, by, {}, pending={}, disjoint=dis)
+        self.assertEqual(d, {})
+        self.assertEqual(dis, [("cf_1", "cf_2")])
+        ck = lambda v: {s: {"itemized": x} for s, x in zip("ACE", v)}
+        res = {"cf_1": {"verdict": "PASS", "fail": [], "checks": ck((100, 0, 50)), "corrections": [], "drop": []},
+               "cf_2": {"verdict": "PASS", "fail": [], "checks": ck((200, 0, 50)), "corrections": [], "drop": []}}
+        R.check_disjoint(dis, res, {}, d)
+        self.assertEqual([res[k]["verdict"] for k in ("cf_1", "cf_2")], ["PASS", "PASS"])
+        res["cf_2"]["checks"] = ck((100, 0, 50))                # identical boxes: one statement read twice
+        R.check_disjoint(dis, res, {}, d)
+        self.assertEqual([(res[k]["verdict"], res[k]["fail"][0]) for k in ("cf_1", "cf_2")],
+                         [("FLAG", "overlapping_periods"), ("FLAG", "overlapping_periods")])
+
+    def test_restated_period_later_filing_supersedes(self):
+        # robot 6: same start, end misread (03-17 vs 03-24), filed in March and again in July, rows mostly shared
+        fs = {"cf_1": filing("cf_1", period_start="2018-02-25", period_end="2018-03-17", filing_date="2018-03-29"),
+              "cf_2": filing("cf_2", period_start="2018-02-25", period_end="2018-03-24", filing_date="2018-07-27")}
+        a = self.rows("cf_1", 9)
+        b = [dict(r, id=r["id"] + "b", filing_id="cf_2") for r in a[:8]]
+        d = self.run_dups(fs, a + b)
+        self.assertEqual(d, {"cf_1": ("superseded_by_amendment", "cf_2")})
+
+    def test_restated_far_end_needs_rows_past_stated_end(self):
+        fs = {"cf_1": filing("cf_1", period_start="2018-02-25", period_end="2018-03-02", filing_date="2018-03-26"),
+              "cf_2": filing("cf_2", period_start="2018-02-25", period_end="2018-03-24", filing_date="2018-10-15")}
+        mk = lambda fid, n, day, mo="03": [dict(row(i, "460A", 20000 + i, date=f"2018-{mo}-{day + (i % 3):02d}"), id=f"{fid}_{i}", filing_id=fid) for i in range(n)]
+        d = self.run_dups(fs, mk("cf_1", 8, 10) + mk("cf_2", 8, 10))       # cf_1's rows run to 03-12, past its 03-02 end
+        self.assertEqual(d, {"cf_1": ("superseded_by_amendment", "cf_2")})
+        b = mk("cf_2", 8, 25, "02")
+        b[-1]["amount_minor"] = 99999                                      # 7 of 8 shared: not the same row set
+        d = self.run_dups(fs, mk("cf_1", 8, 25, "02") + b)                       # rows inside 03-02: not proven, stays flagged
+        self.assertEqual({k: v[0] for k, v in d.items()}, {"cf_1": "overlapping_periods", "cf_2": "overlapping_periods"})
+
+    def test_contained_earlier_statement_mostly_restated_is_superseded(self):
+        # robot 7: pre-election statement filed in March, semi-annual filed in August restates 9 of its 10 rows
+        fs = {"cf_1": filing("cf_1", filing_date="2018-08-22"),
+              "cf_2": filing("cf_2", period_end="2018-02-24", filing_date="2018-03-26")}
+        big = self.rows("cf_1", 20)
+        small = [dict(r, id=r["id"] + "s", filing_id="cf_2") for r in big[:9]] + self.rows("cf_2", 1, base=70)
+        d = self.run_dups(fs, big + small)
+        self.assertEqual(d, {"cf_2": ("superseded_by_containing_period", "cf_1")})
+        fs["cf_2"]["filing_date"] = "2018-10-15"                           # filed after the container: not restated by it
+        d = self.run_dups(fs, big + small)
+        self.assertEqual({k: v[0] for k, v in d.items()}, {"cf_1": "overlapping_periods", "cf_2": "overlapping_periods"})
+
+    def test_period_end_after_filing_date_is_misread(self):
+        self.assertEqual(R.eff_period(filing(period_start="2016-01-01", period_end="2016-04-12", filing_date="2016-02-29")),
+                         ("2016-01-01", "2016-02-29"))
+        self.assertEqual(R.eff_period(filing(filing_date="2018-07-31")), ("2018-01-01", "2018-06-30"))
 
     def test_different_committees_differnt_rows_ok(self):
         fs = {"cf_1": filing("cf_1"), "cf_2": filing("cf_2", filer_identity_id="csi_b", filer_name_raw="Committee B", source_hash="y" * 64)}
