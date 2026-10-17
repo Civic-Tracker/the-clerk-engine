@@ -487,6 +487,106 @@ class TestDuplicates(unittest.TestCase):
         self.assertEqual(self.run_dups(fs, rows), {})
 
 
+class TestCrossFilerCopy(unittest.TestCase):
+    """Robot 12: one statement under two filer identities (Culver PAC pair, staging Oct 17 2026)."""
+    A, B = "cf_627ea263673a2229", "cf_71079a56e9ba5840"
+
+    def setUp(self):
+        kw = dict(period_start="2014-03-24", period_end="2014-04-04", filing_date="2014-04-07", cycle_year=2014)
+        self.fs = {self.A: filing(self.A, filer_identity_id="csi_1931c291dbf22034", **kw),
+                   self.B: filing(self.B, filer_identity_id="csi_446ef86fb622d03b", source_hash="b" * 64, **kw)}
+        self.rows_by = {f: [dict(row(f + "e", "460E", 127371, date=None, state="ACTIVE"), filing_id=f)] for f in self.fs}
+        none = {"rows": 0, "itemized": 0, "box": "none"}
+        ca = {"A": none, "C": none, "E": {"rows": 1, "itemized": 127371, "ok": True, "reads": [
+            {"page": 3, "A": [127371, 71249, 0, 198620], "B": [127371, 0, 0, 198620], "arith": True}]}}
+        cb = {"A": none, "C": none, "E": {"rows": 1, "itemized": 127371, "ok": True, "reads": [
+            {"page": 3, "A": [127371, 71249, 0, 198620], "B": [0, None, 0, 0], "arith": True, "C": [127371, 71249, 0, 198620]}]}}
+        fp = {f: R.rows_fp(R.live_rows(self.rows_by[f])) for f in self.fs}
+        self.prior = {
+            self.A: {"verdict": "PASS", "applied": 1, "rows_fp": fp[self.A], "reason": None, "checks": json.dumps(ca),
+                     "reviewed_at": "Sat 2026-10-17 12:43 AM PDT (UTC-07:00)"},
+            self.B: {"verdict": "PASS", "applied": 1, "rows_fp": fp[self.B], "reason": None, "checks": json.dumps(cb),
+                     "reviewed_at": "Fri 2026-10-16 3:29 PM PDT (UTC-07:00)"}}
+
+    def test_culver_pac_pair_counts_once(self):
+        pairs = R.cross_filer_copies(self.fs, self.rows_by, {}, self.prior)
+        self.assertEqual(pairs, [(self.A, self.B)])                       # earliest-reviewed one is kept
+        res = {}
+        R.apply_cross_filer_copies(pairs, self.fs, self.rows_by, res, self.prior)
+        self.assertEqual(list(res), [self.A])
+        self.assertEqual((res[self.A]["verdict"], res[self.A]["fail"][0], res[self.A]["unflip"]), ("FLAG", "duplicate_copy", True))
+        self.assertEqual(res[self.A]["checks"]["duplicate"]["other"], self.B)
+
+    def test_flag_stands_next_night(self):
+        res = {}
+        R.apply_cross_filer_copies(R.cross_filer_copies(self.fs, self.rows_by, {}, self.prior), self.fs, self.rows_by, res, self.prior)
+        for t in self.rows_by[self.A]:
+            t["record_state"] = "OCR_UNREVIEWED"
+        self.prior[self.A].update(verdict="FLAG", applied=0, reason="duplicate_copy", checks=json.dumps(res[self.A]["checks"]))
+        todo, reapply, unflip = R.plan_work(self.fs, self.rows_by, {}, {}, self.prior)
+        self.assertEqual((todo, unflip), ([], []))
+        self.prior[self.B]["verdict"] = "FLAG"                             # the kept one stopped counting: look again
+        todo, reapply, unflip = R.plan_work(self.fs, self.rows_by, {}, {}, self.prior)
+        self.assertEqual(todo, [self.A])
+
+    def test_differences_keep_both(self):
+        for change in ("box", "row", "date", "period", "flag"):
+            self.setUp()
+            if change == "box":
+                ch = json.loads(self.prior[self.B]["checks"])
+                ch["E"]["reads"] = [{"page": 3, "A": [127371, 71250, 0, 198621], "B": [127371, 71250, 0, 198621]}]
+                self.prior[self.B]["checks"] = json.dumps(ch)
+            elif change == "row":
+                self.rows_by[self.B][0]["amount_minor"] = 127372
+            elif change == "date":
+                self.fs[self.B]["filing_date"] = "2014-04-08"
+            elif change == "period":
+                self.fs[self.B]["period_end"] = "2014-04-05"
+            else:
+                self.prior[self.B]["verdict"] = "FLAG"
+            self.assertEqual(R.cross_filer_copies(self.fs, self.rows_by, {}, self.prior), [], change)
+
+    def test_no_box_read_is_not_enough(self):
+        for f in self.fs:
+            ch = json.loads(self.prior[f]["checks"])
+            ch["E"].pop("reads")
+            self.prior[f]["checks"] = json.dumps(ch)
+        self.assertEqual(R.cross_filer_copies(self.fs, self.rows_by, {}, self.prior), [])
+
+    def test_fresh_pass_this_run_is_flagged(self):
+        for t in self.rows_by[self.A]:
+            t["record_state"] = "OCR_UNREVIEWED"
+        res = {self.A: {"filing_id": self.A, "jurisdiction_id": "jurisdiction-testville", "verdict": "PASS", "fail": [],
+                        "corrections": [], "drop": [], "gap": {}, "checks": json.loads(self.prior[self.A]["checks"])}}
+        del self.prior[self.A]
+        pairs = R.cross_filer_copies(self.fs, self.rows_by, res, self.prior)
+        R.apply_cross_filer_copies(pairs, self.fs, self.rows_by, res, self.prior)
+        self.assertEqual((res[self.A]["verdict"], res[self.A]["fail"]), ("FLAG", ["duplicate_copy"]))
+        self.assertFalse(res[self.A].get("unflip"))
+
+    def test_reviewed_at_order(self):
+        self.assertLess(R._when("Fri 2026-10-16 3:29 PM PDT (UTC-07:00)"), R._when("2026-10-17T07:43:00Z"))
+        self.assertLess(R._when("2026-10-17T07:42:00Z"), R._when("Sat 2026-10-17 12:43 AM PDT (UTC-07:00)"))
+        self.assertEqual(R._when(None), float("inf"))
+
+
+class FakeD1:
+    def __init__(self, ids):
+        self.ids, self.sql = ids, []
+
+    def all(self, sql):
+        self.sql.append(sql)
+        return [{"id": i} for i in self.ids]
+
+
+class TestDiscover(unittest.TestCase):
+    def test_discover_places(self):
+        d = FakeD1(["jurisdiction-beverlyhills", "jurisdiction-culvercity"])
+        self.assertEqual(R.discover_places(d), ["beverlyhills", "culvercity"])
+        self.assertIn("OCR_UNREVIEWED", d.sql[0])
+        self.assertIn("provenance = 'ocr'", d.sql[0])
+
+
 class TestMisc(unittest.TestCase):
     def test_page_range(self):
         self.assertEqual(R.page_range(filing(), lambda: 99), (1, 3))

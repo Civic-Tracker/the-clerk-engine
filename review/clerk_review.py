@@ -25,7 +25,8 @@ reverted (--revert RUN_ID). A place's batch is HELD (nothing written for it) on 
 Never touches prod. Report: ids and counts only.
 
 Usage:
-  python3 review/clerk_review.py --places beverlyhills,culvercity [--max-seconds N] [--dry-run]
+  python3 review/clerk_review.py [--places beverlyhills,culvercity] [--max-seconds N] [--dry-run]
+  (no --places: every place with OCR rows still OCR_UNREVIEWED)
          [--text-dir slug=DIR] [--pdf-dir slug=DIR] [--cache-dir DIR] [--report FILE]
   python3 review/clerk_review.py --revert RUN_ID
 """
@@ -1056,6 +1057,107 @@ def check_disjoint(disjoint, results, prior, dups):
             r["checks"]["duplicate"] = {"reason": "overlapping_periods", "other": o, "why": "disjoint rows but identical summary boxes"}
 
 
+def _when(ts):
+    """Sort key for clerk_reviews.reviewed_at (ISO, or the older 'Sat 2026-10-17 12:43 AM PDT (UTC-07:00)' form)."""
+    ts = (ts or "").strip()
+    try:
+        return datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        pass
+    m = re.match(r"\w{3} (\d{4}-\d{2}-\d{2} \d{1,2}:\d{2} [AP]M) \w+ \(UTC([+-]\d{2}):(\d{2})\)", ts)
+    if m:
+        d = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %I:%M %p")
+        sign = -1 if m.group(2).startswith("-") else 1
+        tz = datetime.timezone(sign * datetime.timedelta(hours=abs(int(m.group(2))), minutes=int(m.group(3))))
+        return d.replace(tzinfo=tz).timestamp()
+    return float("inf")
+
+
+def box_reads(fid, results, prior):
+    """{schedule: set of summary-box read vectors} for the schedules this filing's review read a box on."""
+    r = results.get(fid)
+    ch = r["checks"] if r else json.loads((prior.get(fid) or {}).get("checks") or "{}")
+    out = {}
+    for s in "ACE":
+        vs = set()
+        for rd in ch.get(s, {}).get("reads") or []:
+            for k, v in rd.items():
+                if k not in ("page", "arith") and isinstance(v, list) and any(x is not None for x in v):
+                    vs.add(tuple(v))
+        if vs:
+            out[s] = vs
+    return out
+
+
+def cross_filer_copies(filings, rows_by, results, prior, dups=None):
+    """Robot 12: two passing statements in one place with the same period start and end, the same filing date, the
+    same itemized total on every schedule (A, C, E), the same summary-box read on every schedule both read a box on
+    (at least one), and the same itemized row amounts are ONE statement - even under different filer identities
+    (a redacted re-scan, a committee name read two ways). The earliest-reviewed one counts; the others are
+    duplicate_copy. Returns [(loser, keep)] in id order."""
+    dups = dups or {}
+    passing = [fid for fid in sorted(filings) if fid not in dups and verdict_of(fid, results, prior) in ("PASS", "CORRECTED_PASS")]
+    groups = defaultdict(list)
+    for fid in passing:
+        f = filings[fid]
+        if f.get("period_start") and f.get("period_end") and f.get("filing_date"):
+            groups[(f["jurisdiction_id"], f["period_start"], f["period_end"], f["filing_date"])].append(fid)
+    out = []
+    for ms in groups.values():
+        if len(ms) < 2:
+            continue
+        amts = {m: Counter((r["schedule_code"], r["amount_minor"]) for r in live_rows(rows_by.get(m, [])) if r["amount_minor"]) for m in ms}
+        trip = {m: summary_triple(m, results, prior) for m in ms}
+        reads = {m: box_reads(m, results, prior) for m in ms}
+
+        def same(a, b):
+            if not amts[a] or amts[a] != amts[b] or None in trip[a] or trip[a] != trip[b]:
+                return False
+            both = set(reads[a]) & set(reads[b])
+            return bool(both) and set(reads[a]) == set(reads[b]) and all(reads[a][s] & reads[b][s] for s in both)
+        when = {m: (_when((prior.get(m) or {}).get("reviewed_at")) if m not in results or results[m].get("reapply") else float("inf"), m) for m in ms}
+        done = set()
+        for a in sorted(ms, key=lambda m: when[m]):
+            if a in done:
+                continue
+            for b in sorted(ms, key=lambda m: when[m]):
+                if b != a and b not in done and same(a, b):
+                    out.append((b, a))
+                    done.add(b)
+            done.add(a)
+    return sorted(out)
+
+
+def apply_cross_filer_copies(pairs, filings, rows_by, results, prior):
+    """Turn robot 12's losers into FLAG duplicate_copy. One already counted (rows ACTIVE) is un-counted, the same as a
+    PR #6 copy; one reviewed or re-applied this run simply stays uncounted."""
+    for m, keep in pairs:
+        dup = {"reason": "duplicate_copy", "other": keep, "robot": 12, "why": "same place, period, filing date, summary boxes and row amounts"}
+        r = results.get(m)
+        p = prior.get(m) or {}
+        active = any(t["record_state"] == "ACTIVE" for t in live_rows(rows_by.get(m, [])))
+        if r is None or r.get("reapply"):
+            if r is None and not (p.get("applied") and active):
+                continue
+            ch = json.loads(p.get("checks") or "{}")
+            ch.update(duplicate=dup, was=p.get("verdict"), robot_v=ROBOT_V)
+            results[m] = {"filing_id": m, "jurisdiction_id": filings[m]["jurisdiction_id"], "verdict": "FLAG", "corrections": [], "drop": [],
+                          "fail": ["duplicate_copy"], "gap": {}, "unflip": bool(p.get("applied") and active), "checks": ch}
+        else:
+            r.update(verdict="FLAG", corrections=[], drop=[], fail=["duplicate_copy"] + [x for x in r["fail"] if x != "duplicate_copy"])
+            r["checks"]["duplicate"] = dup
+        if keep in results:
+            results[keep]["checks"].setdefault("copies", [])
+            results[keep]["checks"]["copies"] = sorted(set(results[keep]["checks"]["copies"]) | {m})
+
+
+def discover_places(d1):
+    """Every place with OCR rows still waiting for review (indexed EXISTS per jurisdiction)."""
+    rows = d1.all("""SELECT j.id FROM jurisdictions j WHERE EXISTS (SELECT 1 FROM campaign_transactions t
+        WHERE t.jurisdiction_id = j.id AND t.record_state = 'OCR_UNREVIEWED' AND t.provenance = 'ocr') ORDER BY j.id""")
+    return [slug_of(r["id"]) for r in rows]
+
+
 # ----------------------------------------------------------------------------- main
 def load(d1, places):
     jids = ",".join(F_lit(f"jurisdiction-{p}") for p in places)
@@ -1116,6 +1218,13 @@ def plan_work(filings, rows_by, dups, pending, prior):
             if robot11_helps(p):
                 need = 3
             was = (p["reason"] or "").split(";")[0]
+            try:
+                pd = json.loads(p["checks"] or "{}").get("duplicate") or {}
+            except ValueError:
+                pd = {}
+            if was == "duplicate_copy" and pd.get("robot") == 12 and fid not in dups and \
+                    (prior.get(pd.get("other")) or {}).get("verdict") in ("PASS", "CORRECTED_PASS"):
+                continue                     # robot 12 copy: stands while the statement it copies still counts
             if (fid in dups and was != dups[fid][0]) or \
                     (fid in pending and was_dup and was not in ("amendment_order_unknown", "same_statement_copy")):
                 todo.append(fid)             # still a duplicate, for a different reason (e.g. now superseded): record it
@@ -1130,7 +1239,7 @@ def plan_work(filings, rows_by, dups, pending, prior):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--places", default="beverlyhills,culvercity")
+    ap.add_argument("--places", default="", help="comma-separated slugs; blank = every place with OCR rows awaiting review")
     ap.add_argument("--max-seconds", type=int, default=3000)
     ap.add_argument("--dry-run", action="store_true", help="review and report; write nothing")
     ap.add_argument("--text-dir", action="append", default=[], help="slug=DIR (derived/text)")
@@ -1150,7 +1259,11 @@ def main():
     started = now()
     run_id = args.run_id or "local-" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S")
     deadline = time.time() + args.max_seconds
-    places = [p.strip() for p in args.places.split(",") if p.strip()]
+    places = [p.strip() for p in args.places.split(",") if p.strip()] or discover_places(db)
+    log(f"places: {','.join(places) or '(none)'}")
+    if not places:
+        write_report({"run_id": run_id, "passed": [], "started_at": started, "dry_run": args.dry_run, "places": {}, "flags": []}, args.report)
+        return 0
     pages = Pages(args.cache_dir, dict(x.split("=", 1) for x in args.text_dir), dict(x.split("=", 1) for x in args.pdf_dir), r2=not args.no_r2)
     tx, filings, ef, prior = load(db, places)
     rows_by = defaultdict(list)
@@ -1209,6 +1322,9 @@ def main():
                         "checks": json.loads(p["checks"] or "{}"), "corrections": [], "drop": [], "fail": [], "gap": {}, "reapply": True}
         if fid in dups:                       # a newer duplicate/amendment showed up since: re-flag
             results[fid].update(verdict="FLAG", fail=[dups[fid][0]], reapply=False)
+    # robot 12: one statement filed/scanned under two filer identities counts once
+    pairs = cross_filer_copies(filings, rows_by, results, prior, dups)
+    apply_cross_filer_copies(pairs, filings, rows_by, results, prior)
     for fid, r in results.items():
         r.setdefault("inserts", [])
 
@@ -1308,7 +1424,8 @@ def main():
               for fid, r in sorted(results.items()) if r["verdict"] != "FLAG"]
     report = {"run_id": run_id, "passed": passed, "started_at": started, "dry_run": args.dry_run, "places": place,
               "deferred_filings": deferred, "year_moves": moves, "f496_2022_touched": f496_2022,
-              "flags": flags, "corrections": corrections, "ocr": pages.stats}
+              "flags": flags, "corrections": corrections, "ocr": pages.stats,
+              "cross_filer_copies": [{"filing_id": m, "kept": k} for m, k in pairs]}
 
     # ---- writes
     if not args.dry_run:

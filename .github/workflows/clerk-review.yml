@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       places:
-        description: "comma-separated place slugs"
+        description: "comma-separated place slugs (blank = every place with OCR rows awaiting review)"
         required: false
-        default: "beverlyhills,culvercity"
+        default: ""
       dry_run:
         description: "review and report only (no writes)"
         type: boolean
@@ -55,7 +55,7 @@ jobs:
       - name: Clerk review -> staging
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          PLACES: ${{ github.event.inputs.places || 'beverlyhills,culvercity' }}
+          PLACES: ${{ github.event.inputs.places || '' }}
           DRY: ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
         run: |
           mkdir -p reports
