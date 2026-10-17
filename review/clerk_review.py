@@ -869,6 +869,39 @@ def F_lit(v):
     return _d.lit(v)
 
 
+def plan_work(filings, rows_by, dups, pending, prior):
+    """Which filings to (re)review, which standing verdicts to re-apply, which counted filings to un-count.
+    A CORRECTED_PASS that was never applied (its place's batch was held) has no fixes written to D1, so its verdict
+    cannot be re-applied from the live rows: it is reviewed again, which re-derives the fixes."""
+    todo, reapply, unflip = [], [], []
+    for fid, f in sorted(filings.items()):
+        lr = live_rows(rows_by[fid])
+        p = prior.get(fid)
+        if fid in dups and p and p["verdict"] in ("PASS", "CORRECTED_PASS") and p["applied"] and \
+                any(r["record_state"] == "ACTIVE" for r in lr):
+            unflip.append(fid)               # counted before, now a duplicate / superseded copy: stop counting it
+            continue
+        if not any(r["record_state"] == "OCR_UNREVIEWED" for r in lr):
+            continue
+        same = bool(p) and p["rows_fp"] == rows_fp(lr)
+        if same and p["verdict"] == "CORRECTED_PASS" and not p["applied"]:
+            todo.append(fid)                 # held before: its fixes were never written, re-derive them
+        elif same and p["verdict"] in ("PASS", "CORRECTED_PASS"):
+            reapply.append(fid)              # verdict stands; rows were reset by a re-promote or never applied
+        elif same and p["verdict"] == "FLAG" and not (p["reason"] or "").startswith("reverted"):
+            was_dup = (p["reason"] or "").split(";")[0] in DUP_REASONS
+            try:
+                pv = json.loads(p["checks"] or "{}").get("robot_v", 1)
+            except ValueError:
+                pv = 1
+            if was_dup == (fid in dups or fid in pending) and pv >= ROBOT_V:
+                continue                     # same rows, same duplicate status, same robots: the flag stands
+            todo.append(fid)
+        else:
+            todo.append(fid)
+    return todo, reapply, unflip
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--places", default="beverlyhills,culvercity")
@@ -904,30 +937,7 @@ def main():
     pending = {}
     dups = dup_groups(filings, rows_by, efile_keys, pending=pending)
 
-    todo, reapply, unflip = [], [], []
-    for fid, f in sorted(filings.items()):
-        lr = live_rows(rows_by[fid])
-        p = prior.get(fid)
-        if fid in dups and p and p["verdict"] in ("PASS", "CORRECTED_PASS") and p["applied"] and \
-                any(r["record_state"] == "ACTIVE" for r in lr):
-            unflip.append(fid)               # counted before, now a duplicate / superseded copy: stop counting it
-            continue
-        if not any(r["record_state"] == "OCR_UNREVIEWED" for r in lr):
-            continue
-        p = prior.get(fid)
-        if p and p["rows_fp"] == rows_fp(lr) and p["verdict"] in ("PASS", "CORRECTED_PASS"):
-            reapply.append(fid)              # verdict stands; rows were reset by a re-promote or never applied
-        elif p and p["rows_fp"] == rows_fp(lr) and p["verdict"] == "FLAG" and not (p["reason"] or "").startswith("reverted"):
-            was_dup = (p["reason"] or "").split(";")[0] in DUP_REASONS
-            try:
-                pv = json.loads(p["checks"] or "{}").get("robot_v", 1)
-            except ValueError:
-                pv = 1
-            if was_dup == (fid in dups or fid in pending) and pv >= ROBOT_V:
-                continue                     # same rows, same duplicate status, same robots: the flag stands
-            todo.append(fid)
-        else:
-            todo.append(fid)
+    todo, reapply, unflip = plan_work(filings, rows_by, dups, pending, prior)
 
     log(f'loaded {len(filings)} filings; todo {len(todo)} reapply {len(reapply)}')
     reflag = {f: live_rows(rows_by[f]) for f in todo if f not in dups and prior.get(f) and prior[f]["verdict"] == "FLAG"}

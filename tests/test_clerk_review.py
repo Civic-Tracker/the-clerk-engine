@@ -1,3 +1,4 @@
+import json
 """Clerk review: box reading, reconcile, clerk fixes, duplicates, major-discrepancy hold. Stdlib, no network."""
 import os, sys, unittest
 from collections import defaultdict
@@ -346,6 +347,19 @@ class TestMisc(unittest.TestCase):
         a = [row(1, "460A", 100), row(2, "460E", 200)]
         self.assertEqual(R.rows_fp(a), R.rows_fp(list(reversed(a))))
         self.assertNotEqual(R.rows_fp(a), R.rows_fp([row(1, "460A", 101), row(2, "460E", 200)]))
+
+    def test_held_corrected_pass_is_reviewed_again(self):
+        # a held batch writes the verdict but not its fixes: a CORRECTED_PASS never applied must be re-derived, not re-applied
+        fs = {f: filing(f) for f in ("cf_1", "cf_2", "cf_3", "cf_4")}
+        rows_by = {f: [dict(row(f + "a", "460A", 100), filing_id=f)] for f in fs}
+        fp = {f: R.rows_fp(R.live_rows(rows_by[f])) for f in fs}
+        prior = {"cf_1": {"verdict": "CORRECTED_PASS", "applied": 0, "rows_fp": fp["cf_1"], "reason": None, "checks": "{}"},
+                 "cf_2": {"verdict": "PASS", "applied": 0, "rows_fp": fp["cf_2"], "reason": None, "checks": "{}"},
+                 "cf_3": {"verdict": "CORRECTED_PASS", "applied": 1, "rows_fp": fp["cf_3"], "reason": None, "checks": "{}"},
+                 "cf_4": {"verdict": "FLAG", "applied": 0, "rows_fp": fp["cf_4"], "reason": "A:rows_do_not_reconcile",
+                          "checks": json.dumps({"robot_v": R.ROBOT_V})}}
+        todo, reapply, unflip = R.plan_work(fs, rows_by, {}, {}, prior)
+        self.assertEqual((todo, reapply, unflip), (["cf_1"], ["cf_2", "cf_3"], []))
 
     def test_staging_guard(self):
         import d1
