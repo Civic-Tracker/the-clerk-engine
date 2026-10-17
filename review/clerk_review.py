@@ -41,6 +41,7 @@ ROBOT_V = 3                   # robots version: a FLAG from an older version is 
 # the robots version a standing FLAG needs before it is left alone: phase 3 (v3) only changed the copy check, so only
 # amendment_order_unknown flags are re-read for it; every other flag stands from v2 on
 ROBOT_NEED = {"amendment_order_unknown": 3}
+ROBOT_NEED_ANY = {"rows_do_not_reconcile": 3, "summary_reads_disagree": 3}   # robot 11 (v3) re-reads these once
 MOVE_ABS = 25_000_000   # $250,000 in cents (Bryan dropped the 10% rule, Oct 16 2026)
 OOM_MIN = 5_000_000           # $50,000
 SCHED = {"460A": "A", "460C": "C", "460E": "E"}
@@ -166,6 +167,45 @@ def agreed_box(pages, slug, sha, key, page, sched, deadline):
     if v is not None:
         det["settled_by"] = "read_D"
     return v, det
+
+
+def arith_l1(det):
+    """Robot 11: line 1 from the box's own arithmetic (A/C: 1 + 2 = 3; E: 1 + 2 + 3 = 4) when the line-1 reads do not
+    settle it. Reads that are blank throughout are no evidence. The total line must be agreed by two reads (and no
+    other total by as many), each middle line too; line 1 = total - middle lines, and it must be > 0.
+    Returns the derived line 1 or None."""
+    reads = [det.get(k) for k in ("A", "B", "C", "D")]
+    reads = [r for r in reads if r and any(x for x in r if x)]
+    if len(reads) < 2:
+        return None
+    n = len(reads[0])
+    if any(len(r) != n for r in reads):
+        return None
+    total = vote([r[-1] for r in reads])
+    if not total:
+        return None
+    mids = []
+    for i in range(1, n - 1):
+        m = vote([r[i] for r in reads])
+        if m is None:
+            return None
+        mids.append(m)
+    l1 = total - sum(mids)
+    return l1 if l1 > 0 else None
+
+
+def all_reads(pages, slug, sha, key, det, sched, deadline):
+    """Fill in reads C and D of a box page that A and B settled early (needed by robot 11)."""
+    for k in ("C", "D"):
+        if k in det:
+            continue
+        if k == "D" and not getattr(pages, "has_d", True):
+            continue
+        if time.time() > deadline and not pages.cached(k, sha, det["page"]):
+            raise Deadline()
+        b = F.read_box(pages.read(k, slug, sha, key, det["page"], box=True) or "", sched)
+        det[k] = b and b.get("lines")
+    return det
 
 
 def row_ord(r):
@@ -330,6 +370,13 @@ def review_filing(f, rows, pages, deadline):
                 reads.append((v, det))
             chk["reads"] = [d for _, d in reads]
             vals = {v for v, _ in reads if v is not None}
+            if srows and chk["rows_sum"] > 0 and (not vals or vals == {0}):
+                # robot 11: line 1 read as blank / 0 (or unsettled) while the schedule has rows: the box's total minus
+                # its other lines, each agreed by two reads, settles line 1
+                der = {arith_l1(all_reads(pages, slug, sha, key, d, s, deadline)) for _, d in reads} - {None}
+                if len(der) == 1:
+                    vals = der
+                    chk["settled_by"] = "arith_total"
             if len(vals) > 1:
                 chk["itemized"] = None
                 res["fail"].append(f"{s}:multiple_boxes_differ")
@@ -597,7 +644,30 @@ def restated(fa, fb, amt_a, amt_b, rows_a, rows_b, days=10):
     return bool(last and early["period_end"] < last <= later["period_end"])
 
 
-def dup_groups(filings, rows_by, efile_keys, pending=None, disjoint=None):
+FPPC_ID = re.compile(r"(?<![\d/.,$-])(1[0-9]\d{5})(?![\d/.,])")
+
+
+def cover_ids(pages, filings, fids):
+    """Robot 10 input: the 7-digit FPPC committee ID numbers printed on each statement's cover page (read A).
+    {filing_id: set of ids}; a cover with no readable id is left out."""
+    out = {}
+    for fid in sorted(fids):
+        f = filings[fid]
+        slug, sha, key = slug_of(f["jurisdiction_id"]), f["source_hash"], f["evidence_r2_key"]
+        if not sha:
+            continue
+        try:
+            p0, _ = page_range(f, lambda: pages.pages_of(slug, sha, key))
+            t = pages.read_a(slug, sha, key, p0) or "" if p0 else ""
+        except Exception:
+            continue
+        ids = set(FPPC_ID.findall(t))
+        if ids:
+            out[fid] = ids
+    return out
+
+
+def dup_groups(filings, rows_by, efile_keys, pending=None, disjoint=None, cover=None):
     """{filing_id: (reason, other)} for OCR filings that are duplicates or superseded.
 
     FPPC rules, applied per committee (same filer, or same rows):
@@ -616,7 +686,11 @@ def dup_groups(filings, rows_by, efile_keys, pending=None, disjoint=None):
         review when both pass with identical summary boxes (that would be one statement read twice);
       * any other overlap of one committee's periods stays flagged (overlapping_periods).
     Periods ending after the filing date are read with the filing date as their end (robot 5, eff_period).
+    Robot 10 (`cover` = cover_ids()): statements whose covers print the same FPPC committee ID are one committee
+    (filed under name variants); statements sharing rows whose covers print different IDs are different committees
+    (the same donors on both), not a copy under another name - each still has to reconcile on its own.
     """
+    cover = cover or {}
     out = {}
     sig, amt = {}, {}
     for fid, f in filings.items():
@@ -665,8 +739,11 @@ def dup_groups(filings, rows_by, efile_keys, pending=None, disjoint=None):
                 fb = filings[b]
                 pa, pb = per(fa), per(fb)
                 overlap_period = all(pa) and all(pb) and pa[0] <= pb[1] and pb[0] <= pa[1]
+                ida, idb = cover.get(a, set()), cover.get(b, set())
                 same_filer = bool(fa["filer_identity_id"] and fa["filer_identity_id"] == fb["filer_identity_id"]) or \
-                    bool(name_key(fa["filer_name_raw"]) and name_key(fa["filer_name_raw"]) == name_key(fb["filer_name_raw"]))
+                    bool(name_key(fa["filer_name_raw"]) and name_key(fa["filer_name_raw"]) == name_key(fb["filer_name_raw"])) or \
+                    bool(ida & idb)
+                other_committee = bool(ida and idb and not (ida & idb))
                 unread_filer = not name_key(fa["filer_name_raw"]) or not name_key(fb["filer_name_raw"])
                 sa, sb = sig[a], sig[b]
                 small = min(sum(sa.values()), sum(sb.values()))
@@ -687,7 +764,7 @@ def dup_groups(filings, rows_by, efile_keys, pending=None, disjoint=None):
                     union(a, b)
                 elif unread_filer and near_period(pa, pb) and small >= 5 and ov >= 0.5:
                     union(a, b)               # filer name not read on one copy: same period + same rows = same committee
-                elif small >= 5 and ov >= 0.5 and (overlap_period or not (all(pa) and all(pb))):
+                elif small >= 5 and ov >= 0.5 and (overlap_period or not (all(pa) and all(pb))) and not other_committee:
                     # different (or unread) filer, same rows: a copy filed under another name, or slate donors
                     cross[a].append(b)
                     cross[b].append(a)
@@ -1021,7 +1098,13 @@ def plan_work(filings, rows_by, dups, pending, prior):
                 pv = json.loads(p["checks"] or "{}").get("robot_v", 1)
             except ValueError:
                 pv = 1
-            need = ROBOT_NEED.get((p["reason"] or "").split(";")[0], 2)
+            need = max([ROBOT_NEED.get((p["reason"] or "").split(";")[0], 2)] +
+                       [v for k, v in ROBOT_NEED_ANY.items() if k in (p["reason"] or "")])
+            was = (p["reason"] or "").split(";")[0]
+            if (fid in dups and was != dups[fid][0]) or \
+                    (fid in pending and was_dup and was not in ("amendment_order_unknown", "same_statement_copy")):
+                todo.append(fid)             # still a duplicate, for a different reason (e.g. now superseded): record it
+                continue
             if was_dup == (fid in dups or fid in pending) and pv >= need:
                 continue                     # same rows, same duplicate status, same robots: the flag stands
             todo.append(fid)
@@ -1064,6 +1147,14 @@ def main():
             efile_keys[r["jurisdiction_id"]].add((r["schedule_code"], r["amount_minor"], r["transaction_date"]))
     pending, disjoint = {}, []
     dups = dup_groups(filings, rows_by, efile_keys, pending=pending, disjoint=disjoint)
+    # robot 10: read the FPPC ID off the covers of statements that share rows with another committee's, then regroup
+    cross = {f for f, (why, other) in dups.items() if why == "possible_duplicate_other_filer"}
+    cross |= {o for f in list(cross) for o in dups[f][1].split(",") if o in filings}
+    if cross:
+        cov = cover_ids(pages, filings, cross)
+        if cov:
+            pending, disjoint = {}, []
+            dups = dup_groups(filings, rows_by, efile_keys, pending=pending, disjoint=disjoint, cover=cov)
 
     todo, reapply, unflip = plan_work(filings, rows_by, dups, pending, prior)
 
