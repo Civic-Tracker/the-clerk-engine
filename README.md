@@ -83,7 +83,7 @@ Scanned Form 460s are OCR'd into staging D1 `campaign_transactions` as `record_s
 PASS / CORRECTED_PASS rows go `OCR_UNREVIEWED -> ACTIVE` (provenance stays `ocr`); every flip is in
 `clerk_review_flips` (per run). Verdicts are in `clerk_reviews`. A Time Travel bookmark is taken before any write.
 **Held batch**: a place gets no writes if a counted Raised/Spent total for a (place, year) that already has counted money
-would move > 10% or > $250k, a filing is > 10x its committee's history, a passing filing (after its fixes) matches ACTIVE e-filed rows,
+would move > $250k, a filing is > 10x its committee's history, a passing filing (after its fixes) matches ACTIVE e-filed rows,
 or a non-460 row is in the batch. Years with no counted money yet are new coverage, not a move (reported per year).
 Unresolved filings stay `OCR_UNREVIEWED`; the run report (ids and counts only) lists them with the gap and reason.
 
