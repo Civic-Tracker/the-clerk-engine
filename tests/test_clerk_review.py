@@ -381,6 +381,42 @@ class TestDuplicates(unittest.TestCase):
         self.assertEqual((res["cf_2"]["verdict"], res["cf_2"]["fail"][0]), ("FLAG", "amendment_order_unknown"))
 
 
+    def test_scan_copies_count_once(self):
+        # robot 9: same page span, near-identical covers, boxes never contradict (None = a box one scan could not read)
+        pend = {"cf_1": ["cf_1", "cf_2"], "cf_2": ["cf_1", "cf_2"]}
+        ck = lambda v: {s: {"itemized": x} for s, x in zip("ACE", v)}
+        mk = lambda a, b, va="FLAG", vb="FLAG": {
+            "cf_1": {"verdict": va, "fail": [] if va != "FLAG" else ["A:summary_reads_disagree"], "checks": ck(a), "corrections": [], "drop": []},
+            "cf_2": {"verdict": vb, "fail": [] if vb != "FLAG" else ["E:rows_do_not_reconcile"], "checks": ck(b), "corrections": [], "drop": []}}
+        cov = {("cf_1", "cf_2"): 0.9}
+        res = mk((None, 0, 500), (100, 0, 500))
+        R.resolve_copies(pend, res, {}, covers=cov)
+        self.assertEqual(res["cf_1"]["fail"][0], "same_statement_copy")     # cf_2 has more agreed boxes: it stays
+        self.assertEqual(res["cf_2"]["fail"], ["E:rows_do_not_reconcile"])
+        res = mk((None, 0, 500), (100, 0, 500), vb="PASS")
+        R.resolve_copies(pend, res, {}, covers=cov)
+        self.assertEqual((res["cf_1"]["fail"][0], res["cf_2"]["verdict"]), ("same_statement_copy", "PASS"))
+        res = mk((None, 0, 500), (100, 0, 501))                              # boxes contradict: a clerk decides
+        R.resolve_copies(pend, res, {}, covers=cov)
+        self.assertEqual([res[k]["fail"][0] for k in ("cf_1", "cf_2")], ["amendment_order_unknown"] * 2)
+        res = mk((None, 0, 500), (100, 0, 500))
+        R.resolve_copies(pend, res, {}, covers={("cf_1", "cf_2"): 0.6})       # covers differ: maybe an amendment
+        self.assertEqual([res[k]["fail"][0] for k in ("cf_1", "cf_2")], ["amendment_order_unknown"] * 2)
+        res = mk((None, 0, 500), (100, 0, 500))
+        R.resolve_copies(pend, res, {})                                       # no cover evidence: unchanged behaviour
+        self.assertEqual([res[k]["fail"][0] for k in ("cf_1", "cf_2")], ["amendment_order_unknown"] * 2)
+
+    def test_amendment_flags_reread_for_v3(self):
+        fs = {f: filing(f) for f in ("cf_1", "cf_2")}
+        rows_by = {f: [dict(row(f + "a", "460A", 100), filing_id=f)] for f in fs}
+        fp = {f: R.rows_fp(R.live_rows(rows_by[f])) for f in fs}
+        v2 = json.dumps({"robot_v": 2})
+        prior = {"cf_1": {"verdict": "FLAG", "applied": 0, "rows_fp": fp["cf_1"], "reason": "amendment_order_unknown;A:x", "checks": v2},
+                 "cf_2": {"verdict": "FLAG", "applied": 0, "rows_fp": fp["cf_2"], "reason": "A:rows_do_not_reconcile", "checks": v2}}
+        pend = {"cf_1": ["cf_1", "cf_9"]}
+        todo, reapply, unflip = R.plan_work(fs, rows_by, {}, pend, prior)
+        self.assertEqual(todo, ["cf_1"])
+
     def test_two_scans_few_undated_rows_are_one_statement(self):
         # Weissman case: 3 undated Schedule E rows, filer read as "Weissman" and "Weissman, Andrew" (two identities)
         fs = {"cf_1": filing("cf_1", filer_identity_id="csi_a", filer_name_raw="Weissman", filing_date="2014-01-09", source_hash="a" * 64,
