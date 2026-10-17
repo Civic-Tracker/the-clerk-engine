@@ -41,7 +41,6 @@ ROBOT_V = 3                   # robots version: a FLAG from an older version is 
 # the robots version a standing FLAG needs before it is left alone: phase 3 (v3) only changed the copy check, so only
 # amendment_order_unknown flags are re-read for it; every other flag stands from v2 on
 ROBOT_NEED = {"amendment_order_unknown": 3}
-ROBOT_NEED_ANY = {"rows_do_not_reconcile": 3, "summary_reads_disagree": 3}   # robot 11 (v3) re-reads these once
 MOVE_ABS = 25_000_000   # $250,000 in cents (Bryan dropped the 10% rule, Oct 16 2026)
 OOM_MIN = 5_000_000           # $50,000
 SCHED = {"460A": "A", "460C": "C", "460E": "E"}
@@ -192,6 +191,21 @@ def arith_l1(det):
         mids.append(m)
     l1 = total - sum(mids)
     return l1 if l1 > 0 else None
+
+
+def robot11_helps(p):
+    """A standing FLAG whose stored box reads already give robot 11 a line 1 it did not have (rows > 0, line 1
+    unsettled or 0): worth one more review."""
+    try:
+        ch = json.loads(p.get("checks") or "{}")
+    except ValueError:
+        return False
+    for s in "ACE":
+        k = ch.get(s)
+        if isinstance(k, dict) and k.get("reads") and k.get("rows_sum", 0) > 0 and k.get("itemized") in (None, 0):
+            if {arith_l1(d) for d in k["reads"] if isinstance(d, dict)} - {None}:
+                return True
+    return False
 
 
 def all_reads(pages, slug, sha, key, det, sched, deadline):
@@ -1098,8 +1112,9 @@ def plan_work(filings, rows_by, dups, pending, prior):
                 pv = json.loads(p["checks"] or "{}").get("robot_v", 1)
             except ValueError:
                 pv = 1
-            need = max([ROBOT_NEED.get((p["reason"] or "").split(";")[0], 2)] +
-                       [v for k, v in ROBOT_NEED_ANY.items() if k in (p["reason"] or "")])
+            need = ROBOT_NEED.get((p["reason"] or "").split(";")[0], 2)
+            if robot11_helps(p):
+                need = 3
             was = (p["reason"] or "").split(";")[0]
             if (fid in dups and was != dups[fid][0]) or \
                     (fid in pending and was_dup and was not in ("amendment_order_unknown", "same_statement_copy")):

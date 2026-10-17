@@ -458,6 +458,12 @@ class TestDuplicates(unittest.TestCase):
         pend = {"cf_1": ["cf_1", "cf_9"]}
         todo, reapply, unflip = R.plan_work(fs, rows_by, {}, pend, prior)
         self.assertEqual(todo, ["cf_1"])
+        # robot 11: a flag whose stored reads give line 1 by arithmetic is reviewed once more
+        prior["cf_2"]["checks"] = json.dumps({"robot_v": 2, "E": {"rows_sum": 500, "itemized": 0, "reads": [
+            {"page": 3, "A": [0, 0, 0, 900], "B": [0, 0, 0, 900]}]}})
+        todo, reapply, unflip = R.plan_work(fs, rows_by, {}, pend, prior)
+        self.assertEqual(todo, ["cf_1", "cf_2"])
+        prior["cf_2"]["checks"] = v2
         prior["cf_2"]["reason"] = "possible_duplicate_other_filer"
         todo, reapply, unflip = R.plan_work(fs, rows_by, {"cf_2": ("superseded_by_amendment", "cf_3")}, pend, prior)
         self.assertEqual(todo, ["cf_1", "cf_2"])                           # dup reason changed: re-recorded

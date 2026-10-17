@@ -90,7 +90,15 @@ Scanned Form 460s are OCR'd into staging D1 `campaign_transactions` as `record_s
   cover the same page span with cover pages >= 0.8 alike (difflib on read A) and summary boxes that never contradict
   (a box one scan could not read is no contradiction) is two scans of one statement: the passing one counts, else the
   one with the most agreed boxes stays flagged for its own reasons; the rest are `same_statement_copy`. If both pass
-  without identical boxes, or any box contradicts, it stays `amendment_order_unknown`. Anything else stays flagged.
+  without identical boxes, or any box contradicts, it stays `amendment_order_unknown`.
+- *Cover FPPC ID* (robot 10): statements that share rows with another committee's have the 7-digit FPPC ID read off
+  their cover pages; the same ID = one committee filed under name variants (the normal amendment / copy rules then
+  apply), different IDs = two committees with the same donors (not a duplicate; each must still reconcile).
+  A statement still a duplicate but for a different reason is re-recorded.
+- *Box arithmetic* (robot 11): when line 1 of a summary box is unsettled or reads blank / 0 while the schedule has rows,
+  line 1 = the box total minus its other lines, each agreed by two reads (A/C: 1 + 2 = 3; E: 1 + 2 + 3 = 4); reads C
+  and D are taken if missing, blank reads are no evidence. A standing flag is re-reviewed for it only when its stored
+  reads already give a line 1 this way. Anything else stays flagged.
 
 PASS / CORRECTED_PASS rows go `OCR_UNREVIEWED -> ACTIVE` (provenance stays `ocr`); every flip is in
 `clerk_review_flips` (per run). Verdicts are in `clerk_reviews`. A Time Travel bookmark is taken before any write.
